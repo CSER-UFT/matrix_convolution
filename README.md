@@ -1,251 +1,130 @@
-# Convolucao, DGEMM e Computacao Aproximada
+# TCC2 — convolução, GEMM e computação aproximada
 
-Este projeto mede o desempenho de operacoes com matrizes e compara execucoes exatas com execucoes aproximadas.
+Esta branch contém a continuação experimental do projeto desenvolvido no TCC1. A versão original permanece preservada na branch `main`; a branch `tcc2` separa precisão numérica, aproximação e organização da memória para permitir comparações controladas.
 
-Ele cobre:
+O projeto avalia:
 
-- Convolucao 2D com memoria contigua (`conv_linear`)
-- Convolucao 2D com alocacao por linhas (`conv_malloc`)
-- Multiplicacao densa de matrizes blocada (`dgemm`)
-- Versoes aproximadas com reducao de precisao (`float`)
-- Versoes aproximadas com reducao de operacoes (`skip_kernel` e `skip_k`)
-- Coleta de metricas com `perf`
-- Calculo de erro numerico
-- Geracao de graficos para analise experimental
+- convolução 2D com armazenamento contíguo (`conv_linear`);
+- convolução 2D com alocação por linhas (`conv_malloc`);
+- multiplicação de matrizes em blocos (`gemm`);
+- precisões nativas `float` e `double`;
+- versões completas e aproximadas (`skip_kernel` e `skip_k`);
+- tempo, ciclos, instruções, IPC e contadores de cache e desvios;
+- erro absoluto médio, erro relativo médio, RMSE e erro máximo.
 
-## Estrutura
-
-```text
-Codigos_Linux/
-  Makefile
-  main_linear.c
-  main_malloc.c
-  dgemm_blocked.c
-  conv_linear_approx.c
-  conv_malloc_approx.c
-  dgemm_approx.c
-  run_all.sh
-  analysis.py
-  plot_metrics.py
-```
-
-## Requisitos no Ubuntu
-
-```bash
-sudo apt update
-sudo apt install build-essential linux-tools-common linux-tools-generic python3 python3-pip
-pip install pandas matplotlib
-```
-
-## Compilacao
-
-```bash
-cd Codigos_Linux
-make
-```
-
-Executaveis gerados:
+## Organização
 
 ```text
-conv_linear
-conv_malloc
-dgemm
-conv_linear_approx
-conv_malloc_approx
-dgemm_approx
+program/                         código C e validadores
+scripts/                         entradas, execução, análise e gráficos
+condor/                          submissão e execução pelo HTCondor
+inputs/README.md                 formato das entradas fixas
+results/full_20260922_095004/    CSVs consolidados da campanha no Saruê
+results/figures_full_20260922/   figuras em PDF e PNG
+docs/                            auditoria e instruções dos gráficos
+Makefile                         compilação, validação e gráficos
+run_condor.sh                    preparação e submissão da campanha completa
 ```
 
-Para limpar:
+Entradas binárias, executáveis, arquivos brutos do `perf`, ambientes virtuais e pacotes compactados não são versionados. As entradas são determinísticas e podem ser geradas novamente.
+
+## Requisitos
+
+Ambiente utilizado na campanha publicada:
+
+- Ubuntu Server 20.04;
+- GCC 9.4.0;
+- perf 5.4.291;
+- Python 3.8.10;
+- NumPy, pandas, Matplotlib e SciPy nas versões de `requirements.txt`.
+
+Preparação do Python:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+## Entradas, compilação e validação
+
+```bash
+python3 scripts/generate_inputs.py all
 make clean
+make
+make validate
 ```
 
-## Execucao Manual
+São gerados doze executáveis: três operações, duas precisões e duas técnicas. `float` e `double` usam arquivos de entrada próprios, sem conversão das matrizes durante a medição.
 
-### Convolucao exata
+## Execução local
+
+Teste rápido da infraestrutura:
 
 ```bash
-./conv_linear <N> <dist> <K> [seed]
-./conv_malloc <N> <dist> <K> [seed]
+chmod +x scripts/run_benchmark.sh
+./scripts/run_benchmark.sh --quick
 ```
 
-Parametros:
-
-- `N`: tamanho da matriz
-- `dist`: `0` uniforme, `1` normal, `2` exponencial
-- `K`: tamanho do kernel, positivo, impar e menor ou igual a `N`
-- `seed`: semente opcional para reproduzir a mesma entrada
-
-Exemplo:
+Campanha completa:
 
 ```bash
-./conv_linear 512 0 3 12346
-./conv_malloc 512 0 3 12346
+./scripts/run_benchmark.sh --full
 ```
 
-### Convolucao aproximada
+O perfil completo usa matrizes de ordem 512, 1024 e 2048, kernels 3, 5 e 7, blocos 8, 16, 32, 64 e 128 e 50 repetições. O `perf` mede o programa inteiro, incluindo leitura, organização dos dados, alocação, cálculo, checksum e liberação.
+
+## Execução pelo HTCondor
+
+Depois de gerar as entradas:
 
 ```bash
-./conv_linear_approx <N> <dist> <K> <approx_type> <seed>
-./conv_malloc_approx <N> <dist> <K> <approx_type> <seed>
+chmod +x run_condor.sh condor/run_full_job.sh scripts/run_benchmark.sh
+./run_condor.sh
 ```
 
-Tipos de aproximacao:
+O script recompila, executa os doze validadores, cria `job_input.tar.gz`, submete o job e informa o identificador do cluster. O pacote temporário não é versionado.
 
-- `float`: executa a convolucao usando precisao simples internamente
-- `skip_kernel`: usa apenas parte do kernel e renormaliza os pesos usados
+## Resultados publicados
 
-Exemplo:
+A campanha `full_20260922_095004` contém:
+
+- 276 configurações;
+- 50 repetições por configuração;
+- 13.800 registros consolidados;
+- 10.350 comparações pareadas;
+- 207 comparações de erro numérico;
+- 37 figuras em PDF e PNG.
+
+Os CSVs publicados permitem reproduzir a análise sem os 82 mil arquivos brutos. A auditoria completa está em `docs/AUDITORIA_CAMPANHA_FULL_20260922.md`.
+
+A CPU operou com governador `powersave`. Essa condição foi registrada e aceita para a campanha. Como o tempo apresentou maior variação, ciclos são usados como principal métrica de desempenho e o tempo observado é apresentado com intervalos de confiança.
+
+## Gerar novamente os gráficos
 
 ```bash
-./conv_linear_approx 512 0 3 float 12346
-./conv_malloc_approx 512 0 3 skip_kernel 12346
+make plots
 ```
 
-Opcionalmente, os aproximados aceitam um ultimo argumento:
+As figuras são gravadas em `results/figures_full_20260922`. O índice nessa pasta informa a pergunta, os filtros e a fonte de cada gráfico.
 
-- `measure`: executa apenas a aproximacao, ideal para medir com `perf`
-- `compare`: executa a aproximacao e calcula erro contra a referencia exata
-
-O `run_all.sh` usa os dois modos automaticamente para evitar que o calculo da referencia exata contamine as metricas do `perf`.
-
-### DGEMM exato
+Para analisar outro pacote produzido pelo Condor:
 
 ```bash
-./dgemm <N> <BS> [seed]
+python3 scripts/prepare_analysis_data.py caminho/do/pacote.tar.gz
+python3 scripts/generate_plots.py --clean
 ```
 
-Parametros:
+## Limpeza
 
-- `N`: tamanho da matriz
-- `BS`: tamanho do bloco
-- `seed`: semente opcional
+`make clean` remove somente os executáveis de `bin/`.
 
-Exemplo:
+Para remover executáveis, entradas e campanhas locais geradas:
 
 ```bash
-./dgemm 512 32 12346
+chmod +x scripts/reset_generated.sh
+./scripts/reset_generated.sh
 ```
 
-### DGEMM aproximado
-
-```bash
-./dgemm_approx <N> <BS> <approx_type> <seed>
-```
-
-Tipos de aproximacao:
-
-- `float`: multiplica usando precisao simples internamente
-- `skip_k`: reduz operacoes pulando parte do somatorio em `k`
-
-Exemplo:
-
-```bash
-./dgemm_approx 512 32 float 12346
-./dgemm_approx 512 32 skip_k 12346
-```
-
-Assim como nas convolucoes aproximadas, `dgemm_approx` tambem aceita `measure` ou `compare` como ultimo argumento opcional.
-
-## Execucao Automatizada
-
-```bash
-chmod +x run_all.sh
-sudo ./run_all.sh
-```
-
-O script executa 10 repeticoes para cada combinacao de:
-
-- Programa
-- Tamanho `N`
-- Distribuicao de entrada
-- Kernel ou bloco
-- Tipo de aproximacao
-- Seed padronizada
-
-Ele gera:
-
-```text
-resultados.csv
-```
-
-Colunas do CSV:
-
-```text
-program,mode,approx_type,N,dist,K,seed,tempo,cycles,instructions,
-cache_references,cache_misses,checksum,error_abs_mean,error_rel_mean,
-rmse,error_max
-```
-
-Observacao: no `dgemm`, a coluna `K` armazena o tamanho do bloco (`BS`) e `dist` recebe `-`.
-
-## Analise Estatistica
-
-```bash
-python3 analysis.py
-```
-
-Gera:
-
-```text
-resumo_estatistico.csv
-```
-
-O resumo inclui:
-
-- Tempo medio
-- Desvio padrao
-- IPC medio
-- Taxa media de cache miss
-- Erro absoluto medio
-- Erro relativo medio
-- RMSE
-- Erro maximo
-- Speedup em relacao a versao exata
-
-## Graficos
-
-```bash
-python3 plot_metrics.py
-```
-
-Os graficos sao salvos em:
-
-```text
-results/
-```
-
-Arquivos gerados:
-
-```text
-01_tempo_por_N.png
-02_speedup_aproximado.png
-03_erro_relativo_medio.png
-04_erro_vs_speedup.png
-05_ipc_por_N.png
-06_cache_miss_rate_por_N.png
-07_tempo_vs_erro.png
-```
-
-Esses graficos foram pensados para apoiar a discussao do TCC:
-
-- Tempo de execucao por tamanho de matriz
-- Ganho de desempenho das aproximacoes
-- Erro relativo medio
-- Relacao entre erro e speedup
-- IPC
-- Cache miss rate
-- Custo computacional vs erro aproximado
-
-## Ideia Experimental
-
-As versoes exatas servem como referencia.
-
-As versoes aproximadas medem o ganho de desempenho aceitando perda numerica controlada. O projeto registra essa troca usando metricas de erro e speedup:
-
-```text
-speedup = tempo_exato / tempo_aproximado
-```
-
-Quanto maior o speedup, maior o ganho de desempenho. Quanto menor o erro, mais proximo o resultado aproximado fica da referencia exata.
+Os resultados consolidados versionados e as figuras publicadas não são removidos pelo script de reset.
