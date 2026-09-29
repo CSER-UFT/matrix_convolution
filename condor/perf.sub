@@ -1,0 +1,21 @@
+universe = vanilla
+
+executable = condor/run_full_job.sh
+
+request_cpus = 1
+request_memory = 4GB
+request_disk = 6GB
+
+getenv = False
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+transfer_input_files = job_input.tar.gz
+transfer_output_files = condor_full_results.tar.gz,condor_full_results.tar.gz.sha256
+
+output = condor/logs/$(Cluster)_$(Process).out
+error  = condor/logs/$(Cluster)_$(Process).err
+log    = condor/logs/$(Cluster).log
+
+queue 1
