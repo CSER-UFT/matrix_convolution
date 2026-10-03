@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Gera uma vez as entradas binárias fixas e o manifesto SHA-256 da campanha."""
+"""Gera uma vez as entradas binárias fixas e o manifesto SHA256 da campanha.
+
+Mudanças em relação à versão anterior:
+  * GEMM com mais de uma distribuição (gemm_n{N}_d{dist}.bin). Com valores todos
+    positivos o erro relativo do skip_k fica artificialmente pequeno; a
+    distribuição 1 (normal, média zero) mostra o caso desfavorável.
+  * Três tipos de kernel de convolução (kernel_{tipo}_k{K}.bin):
+      rand   pesos aleatórios positivos com soma 1 (o kernel da campanha anterior)
+      gauss  suavização gaussiana (sigma no padrão do OpenCV), soma 1
+      sobel  derivada horizontal de Sobel generalizada, soma zero, norma L1 = 1
+    O campo "dist" do cabeçalho do kernel guarda o tipo (0, 1, 2).
+"""
 
 import argparse
 import hashlib
@@ -15,6 +26,12 @@ INPUTS = ROOT / "inputs"
 PRECISIONS = {
     "float": (1, "<f"),
     "double": (2, "<d"),
+}
+KERNEL_TYPES = {"rand": 0, "gauss": 1, "sobel": 2}
+
+PROFILES = {
+    "quick": {"sizes": [64, 128], "conv_dists": [0, 1], "gemm_dists": [0, 1], "kernels": [3, 5]},
+    "full": {"sizes": [512, 1024, 2048], "conv_dists": [0, 1, 2], "gemm_dists": [0, 1], "kernels": [3, 5, 7]},
 }
 
 
@@ -34,10 +51,10 @@ class SplitMix64:
 
 
 def values(prng: SplitMix64, count: int, dist: int):
-    if dist == 0:
+    if dist == 0:  # uniforme em (0, 1)
         for _ in range(count):
             yield prng.uniform()
-    elif dist == 1:
+    elif dist == 1:  # normal padrão (Box Muller)
         produced = 0
         while produced < count:
             u1, u2 = prng.uniform(), prng.uniform()
@@ -47,7 +64,7 @@ def values(prng: SplitMix64, count: int, dist: int):
                 if produced < count:
                     yield value
                     produced += 1
-    elif dist == 2:
+    elif dist == 2:  # exponencial de média 1
         for _ in range(count):
             yield -math.log1p(-prng.uniform())
     else:
@@ -75,27 +92,57 @@ def write_file(path: Path, kind: int, n: int, dist: int, seed: int,
     temporary.replace(path)
 
 
-def generate_matrix(n: int, dist: int, precision: str, data_type: int, value_format: str):
+def generate_matrix(n, dist, precision, data_type, value_format):
     seed = 12346 + dist
     path = INPUTS / precision / f"matrix_n{n}_d{dist}.bin"
     write_file(path, 1, n, dist, seed, values(SplitMix64(seed), n * n, dist),
                n * n, data_type, value_format)
 
 
-def generate_gemm(n: int, precision: str, data_type: int, value_format: str):
-    seed = 22346
-    path = INPUTS / precision / f"gemm_n{n}.bin"
-    write_file(path, 2, n, -1, seed, values(SplitMix64(seed), 2 * n * n, 0),
+def generate_gemm(n, dist, precision, data_type, value_format):
+    seed = 22346 + dist
+    path = INPUTS / precision / f"gemm_n{n}_d{dist}.bin"
+    write_file(path, 2, n, dist, seed, values(SplitMix64(seed), 2 * n * n, dist),
                2 * n * n, data_type, value_format)
 
 
-def generate_kernel(k: int, precision: str, data_type: int, value_format: str):
+def binomial(m):
+    return [math.comb(m, i) for i in range(m + 1)]
+
+
+def convolve(x, y):
+    out = [0.0] * (len(x) + len(y) - 1)
+    for i, a in enumerate(x):
+        for j, b in enumerate(y):
+            out[i + j] += a * b
+    return out
+
+
+def kernel_values(kind: str, k: int, seed: int):
+    if kind == "rand":
+        raw = list(values(SplitMix64(seed), k * k, 0))
+        total = sum(raw)
+        return [v / total for v in raw]
+    if kind == "gauss":
+        sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
+        g = [math.exp(-((i - k // 2) ** 2) / (2 * sigma * sigma)) for i in range(k)]
+        raw = [gi * gj for gi in g for gj in g]
+        total = sum(raw)
+        return [v / total for v in raw]
+    if kind == "sobel":
+        smooth = binomial(k - 1)
+        derivative = convolve([-1.0, 0.0, 1.0], binomial(k - 3))
+        raw = [si * dj for si in smooth for dj in derivative]
+        l1 = sum(abs(v) for v in raw)
+        return [v / l1 for v in raw]
+    raise ValueError(kind)
+
+
+def generate_kernel(kind, k, precision, data_type, value_format):
     seed = 32346 + k
-    raw = list(values(SplitMix64(seed), k * k, 0))
-    total = sum(raw)
-    normalized = (value / total for value in raw)
-    write_file(INPUTS / precision / f"kernel_k{k}.bin", 3, k, -1, seed,
-               normalized, k * k, data_type, value_format)
+    data = kernel_values(kind, k, seed)
+    write_file(INPUTS / precision / f"kernel_{kind}_k{k}.bin", 3, k, KERNEL_TYPES[kind],
+               seed, data, k * k, data_type, value_format)
 
 
 def write_manifest():
@@ -110,19 +157,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("profile", choices=("quick", "full", "all"), nargs="?", default="all")
     args = parser.parse_args()
+    selected = ["quick", "full"] if args.profile == "all" else [args.profile]
     INPUTS.mkdir(parents=True, exist_ok=True)
-    sizes = [64] if args.profile == "quick" else [512, 1024, 2048]
-    if args.profile == "all":
-        sizes = [64, 512, 1024, 2048]
-    distributions = [0] if args.profile == "quick" else [0, 1, 2]
-    kernels = [3] if args.profile == "quick" else [3, 5, 7]
     for precision, (data_type, value_format) in PRECISIONS.items():
-        for n in sizes:
-            for dist in distributions:
-                generate_matrix(n, dist, precision, data_type, value_format)
-            generate_gemm(n, precision, data_type, value_format)
-        for k in kernels:
-            generate_kernel(k, precision, data_type, value_format)
+        for name in selected:
+            profile = PROFILES[name]
+            for n in profile["sizes"]:
+                for dist in profile["conv_dists"]:
+                    generate_matrix(n, dist, precision, data_type, value_format)
+                for dist in profile["gemm_dists"]:
+                    generate_gemm(n, dist, precision, data_type, value_format)
+            for k in profile["kernels"]:
+                for kind in KERNEL_TYPES:
+                    generate_kernel(kind, k, precision, data_type, value_format)
     write_manifest()
     print(f"Entradas fixas geradas em {INPUTS}")
 

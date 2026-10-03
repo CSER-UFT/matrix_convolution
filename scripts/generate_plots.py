@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
-"""Gera os gráficos científicos da campanha de convolução e GEMM."""
+"""Gera os gráficos científicos da campanha de convolução e GEMM (TCC2).
+
+Adaptado ao esquema de dados revisado (eixo step, tipos de kernel, comparação
+combined, erro pela norma e energia RAPL).
+
+Convenções visuais:
+  * Legendas sempre FORA da área de desenho, abaixo da figura, compartilhadas
+    entre os painéis. Nenhuma legenda dentro dos eixos.
+  * Cor identifica a precisão (double azul, float laranja) ou, quando a
+    precisão já está em outro canal, o tamanho N ou o passo.
+  * Estilo de linha e marcador identificam o passo (1 = versão completa), de
+    modo que a identidade nunca depende só da cor.
+  * Speedups e economias: média geométrica com IC 95% (t de Student no log).
+  * Tempos e energias: média com IC 95% das repetições independentes.
+
+Cada figura sai em PDF vetorial e PNG, com índice em INDICE_GRAFICOS.md/.csv.
+"""
 
 import argparse
 import csv
 import math
 import re
 import shutil
-import textwrap
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.ticker import LogFormatterSciNotation, LogLocator, NullFormatter
+from matplotlib.transforms import offset_copy
 import numpy as np
 import pandas as pd
 
@@ -20,36 +38,45 @@ try:
 except ImportError:
     stats = None
 
+# Paletas categóricas validadas para daltonismo (todas as combinações de pares):
+#   PREC_COLOR: reservada para a precisão (double azul, float laranja), sempre.
+#   DIM: outra dimensão categórica (N, distribuição, passo, parâmetro), no máximo 3.
+# O magenta tem contraste baixo com o fundo; por isso toda série também tem
+# marcador próprio e entrada na legenda.
+PREC_COLOR = {"double": "#2a78d6", "float": "#eb6834"}
+DIM = ["#008300", "#4a3aa7", "#e87ba4"]
+STEP_STYLE = {1: ("-", "o"), 2: ("--", "s"), 3: (":", "^"), 4: ("-.", "D")}
+INK = "#2b2b2b"
+MUTED = "#6b6b6b"
+GRID = "#d9d9d6"
 
-COLORS = {"double": "#2166ac", "float": "#b2182b"}
-TECH_LINE = {"full": "-", "skip_kernel": "--", "skip_k": "--"}
-TECH_MARK = {"full": "o", "skip_kernel": "s", "skip_k": "s"}
 OP_LABEL = {
-    "conv_linear": "Convolução contígua",
-    "conv_malloc": "Convolução por linhas",
-    "gemm": "Multiplicação de matrizes",
+    "conv_linear": "Convolução (alocação contígua)",
+    "conv_malloc": "Convolução (alocação por linhas)",
+    "gemm": "Multiplicação de matrizes (GEMM)",
 }
+OPERATIONS = ["conv_linear", "conv_malloc", "gemm"]
 DIST_LABEL = {0: "uniforme", 1: "normal", 2: "exponencial"}
-PROGRAM_SHORT = {
-    "conv_linear_double_full": "CL D completa",
-    "conv_linear_float_full": "CL F completa",
-    "conv_linear_double_skip_kernel": "CL D aproximada",
-    "conv_linear_float_skip_kernel": "CL F aproximada",
-    "conv_malloc_double_full": "CM D completa",
-    "conv_malloc_float_full": "CM F completa",
-    "conv_malloc_double_skip_kernel": "CM D aproximada",
-    "conv_malloc_float_skip_kernel": "CM F aproximada",
-    "gemm_double_full": "GEMM D completa",
-    "gemm_float_full": "GEMM F completa",
-    "gemm_double_skip_k": "GEMM D aproximada",
-    "gemm_float_skip_k": "GEMM F aproximada",
+KERNEL_LABEL = {"rand": "aleatório", "gauss": "gaussiano", "sobel": "Sobel"}
+COMPARISON_LABEL = {
+    "approximation_double": "aproximada double / completa double",
+    "approximation_float": "aproximada float / completa float",
+    "combined": "aproximada float / completa double",
 }
-METRIC_LABEL = {
-    "cycles": "Ciclos",
-    "instructions": "Instruções",
-    "ipc": "Instruções por ciclo (IPC)",
-    "time_sec": "Tempo observado (s)",
-}
+COMPARISON_MARK = {"approximation_double": "o", "approximation_float": "s", "combined": "^"}
+
+# Recortes usados nas figuras que não mostram todas as combinações.
+CONV_DIST = 0
+CONV_KERNEL = "gauss"
+GEMM_DIST = 0
+
+
+def step_label(step):
+    return "passo 1 (completa)" if step == 1 else f"passo {step}"
+
+
+def param_symbol(operation):
+    return "B" if operation == "gemm" else "K"
 
 
 def boxplot_label_argument(labels):
@@ -58,24 +85,85 @@ def boxplot_label_argument(labels):
     return {"tick_labels" if version >= (3, 9) else "labels": labels}
 
 
+def mean_ci(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan, np.nan
+    mean = values.mean()
+    if len(values) < 2:
+        return mean, 0.0
+    critical = stats.t.ppf(0.975, len(values) - 1) if stats else 1.96
+    return mean, critical * values.std(ddof=1) / math.sqrt(len(values))
+
+
+def gmean_ci(values):
+    """Média geométrica e intervalo assimétrico (inferior, superior) em escala original."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values) & (values > 0)]
+    if len(values) == 0:
+        return np.nan, (np.nan, np.nan)
+    logs = np.log(values)
+    center = logs.mean()
+    half = 0.0
+    if len(values) >= 2:
+        critical = stats.t.ppf(0.975, len(values) - 1) if stats else 1.96
+        half = critical * logs.std(ddof=1) / math.sqrt(len(values))
+    g = math.exp(center)
+    return g, (g - math.exp(center - half), math.exp(center + half) - g)
+
+
 class Plotter:
     def __init__(self, data_dir: Path, output: Path, formats, dpi: int):
-        self.data_dir = data_dir
         self.output = output
         self.formats = formats
         self.dpi = dpi
         self.index = []
-        self.raw = pd.read_csv(data_dir / "results_raw.csv", keep_default_na=False)
-        self.summary = pd.read_csv(data_dir / "results_summary.csv", keep_default_na=False)
-        self.comp_raw = pd.read_csv(data_dir / "comparisons_raw.csv", keep_default_na=False)
-        self.comp = pd.read_csv(data_dir / "comparisons_summary.csv", keep_default_na=False)
-        self.accuracy = pd.read_csv(data_dir / "accuracy.csv", keep_default_na=False)
-        for frame in [self.raw, self.summary, self.comp_raw, self.comp, self.accuracy]:
-            for col in ["N", "dist", "parameter", "repetition"]:
-                if col in frame:
-                    frame[col] = pd.to_numeric(frame[col], errors="raise").astype(int)
+        self.raw = self.load(data_dir / "results_raw.csv")
+        self.comp = self.load(data_dir / "comparisons_raw.csv")
+        self.accuracy = self.load(data_dir / "accuracy.csv")
+        self.summary = self.load(data_dir / "results_summary.csv")
+        self.has_energy = "energy_j" in self.raw and self.raw["energy_j"].notna().any()
 
-    def save(self, fig, category, name, title, question, source, filters="Todos os casos aplicáveis"):
+    @staticmethod
+    def load(path):
+        frame = pd.read_csv(path)
+        for col in ["N", "dist", "parameter", "repetition", "step"]:
+            if col in frame:
+                frame[col] = pd.to_numeric(frame[col], errors="raise").astype(int)
+        if "kernel_type" in frame:
+            frame["kernel_type"] = frame["kernel_type"].fillna("none").astype(str)
+        return frame
+
+    # ------------------------------------------------------------------ util
+    @staticmethod
+    def representative(values):
+        """Até 3 valores (menor, central, maior), respeitando o limite de cores."""
+        values = sorted(values)
+        if len(values) <= 3:
+            return values
+        return [values[0], values[len(values) // 2], values[-1]]
+
+    @staticmethod
+    def log_error_axis(ax, axis="x"):
+        """Eixo log legível também quando os dados cobrem menos de uma década."""
+        target = ax.xaxis if axis == "x" else ax.yaxis
+        target.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0), numticks=10))
+        target.set_major_formatter(LogFormatterSciNotation(labelOnlyBase=False))
+        target.set_minor_formatter(NullFormatter())
+
+    def slice_op(self, frame, operation, conv_dist=CONV_DIST, kernel=CONV_KERNEL, gemm_dist=GEMM_DIST):
+        sub = frame[frame.operation == operation]
+        if operation == "gemm":
+            return sub[sub.dist == gemm_dist]
+        return sub[(sub.dist == conv_dist) & (sub.kernel_type == kernel)]
+
+    def slice_note(self, operation):
+        if operation == "gemm":
+            return f"entrada {DIST_LABEL[GEMM_DIST]}"
+        return f"entrada {DIST_LABEL[CONV_DIST]}, kernel {KERNEL_LABEL[CONV_KERNEL]}"
+
+    def save(self, fig, category, name, title, question, source, filters):
         directory = self.output / category
         directory.mkdir(parents=True, exist_ok=True)
         paths = []
@@ -84,457 +172,568 @@ class Plotter:
             fig.savefig(path, dpi=self.dpi, bbox_inches="tight", facecolor="white")
             paths.append(path.relative_to(self.output).as_posix())
         plt.close(fig)
-        self.index.append({
-            "categoria": category,
-            "figura": name,
-            "titulo": title,
-            "pergunta": question,
-            "filtros": filters,
-            "fonte": source,
-            "arquivos": "; ".join(paths),
-        })
+        self.index.append({"categoria": category, "figura": name, "titulo": title,
+                           "pergunta": question, "filtros": filters, "fonte": source,
+                           "arquivos": "; ".join(paths)})
 
     @staticmethod
-    def finish(ax, xlabel=None, ylabel=None, title=None, legend=True, logy=False):
+    def style_axes(ax, xlabel=None, ylabel=None, title=None, logx=False, logy=False):
         if xlabel:
-            ax.set_xlabel(xlabel)
+            ax.set_xlabel(xlabel, color=INK)
         if ylabel:
-            ax.set_ylabel(ylabel)
+            ax.set_ylabel(ylabel, color=INK)
         if title:
-            ax.set_title(title, loc="left", fontweight="bold", pad=10)
+            ax.set_title(title, loc="left", fontsize=10, color=INK, pad=6)
+        if logx:
+            ax.set_xscale("log", base=2)
         if logy:
             ax.set_yscale("log")
-        ax.grid(True, linestyle="--", alpha=0.28, linewidth=0.7)
-        if legend:
-            handles, labels = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(frameon=False, fontsize=8)
+            Plotter.log_error_axis(ax, "y")
+        ax.grid(True, color=GRID, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.tick_params(colors=MUTED, labelcolor=INK, labelsize=8)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color(MUTED)
 
     @staticmethod
-    def mean_ci(values):
-        values = np.asarray(values, dtype=float)
-        values = values[np.isfinite(values)]
-        if len(values) == 0:
-            return np.nan, np.nan
-        mean = values.mean()
-        if len(values) < 2:
-            return mean, 0.0
-        sem = values.std(ddof=1) / math.sqrt(len(values))
-        critical = stats.t.ppf(0.975, len(values) - 1) if stats else 1.96
-        return mean, critical * sem
+    def set_n_ticks(ax, values):
+        values = sorted(set(int(v) for v in values))
+        ax.set_xticks(values)
+        ax.set_xticklabels([str(v) for v in values])
+        ax.minorticks_off() if ax.get_xscale() == "log" else None
 
+    @staticmethod
+    def reference_line(ax, value=1.0):
+        ax.axhline(value, color=MUTED, linestyle=(0, (2, 2)), linewidth=0.9, zorder=1)
+
+    @staticmethod
+    def legend_below(fig, handles=None, labels=None, axes=None, ncol=None, title=None):
+        """Legenda única da figura, abaixo dos painéis, fora da área de desenho."""
+        if handles is None:
+            seen = {}
+            for ax in np.atleast_1d(axes).ravel():
+                for handle, label in zip(*ax.get_legend_handles_labels()):
+                    if label not in seen and not label.startswith("_"):
+                        seen[label] = handle
+            labels, handles = list(seen.keys()), list(seen.values())
+        if not handles:
+            return
+        ncol = ncol or min(len(handles), 4)
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+                   ncol=ncol, frameon=False, fontsize=8, title=title, title_fontsize=8,
+                   handlelength=2.6, columnspacing=1.6)
+
+    @staticmethod
+    def title(fig, text, subtitle=None):
+        """Título e subtítulo acima dos painéis, com afastamento fixo em pontos.
+
+        Deve ser chamado DEPOIS do tight_layout (que usa rect com topo 1.0)."""
+        base = fig.transFigure
+        y_title = 4 if not subtitle else 18
+        if subtitle:
+            fig.text(0.01, 1.0, subtitle, ha="left", va="bottom", fontsize=8.5, color=MUTED,
+                     transform=offset_copy(base, fig=fig, y=4, units="points"))
+        fig.text(0.01, 1.0, text, ha="left", va="bottom", fontsize=12, fontweight="bold", color=INK,
+                 transform=offset_copy(base, fig=fig, y=y_title, units="points"))
+
+    def panels(self, count, width=4.0, height=3.4, sharey=True):
+        fig, axes = plt.subplots(1, count, figsize=(max(width * count, 6.0), height),
+                                 sharey=sharey, squeeze=False)
+        return fig, axes[0]
+
+    def series_line(self, ax, x, y, err, color, step, label, asymmetric=False):
+        linestyle, marker = STEP_STYLE.get(step, ("-", "o"))
+        yerr = np.array(err).T if asymmetric else err
+        ax.errorbar(x, y, yerr=yerr, color=color, linestyle=linestyle, marker=marker,
+                    markersize=5.5, linewidth=1.6, capsize=2.5, elinewidth=0.9, label=label,
+                    markeredgecolor="white", markeredgewidth=0.6)
+
+    # ----------------------------------------------------------- desempenho
     def performance(self):
-        for operation in ["conv_linear", "conv_malloc", "gemm"]:
-            params = sorted(self.raw.loc[self.raw.operation == operation, "parameter"].unique())
-            for metric in ["cycles", "instructions", "ipc", "time_sec"]:
-                fig, axes = plt.subplots(1, len(params), figsize=(4.3 * len(params), 4.3), sharey=True)
-                axes = np.atleast_1d(axes)
-                selected_dist = -1 if operation == "gemm" else 0
-                subset = self.raw[(self.raw.operation == operation) & (self.raw.dist == selected_dist)]
+        metrics = [
+            ("time_sec", "Tempo por execução do kernel (s)", True, "tempo"),
+            ("effective_gops", "GFLOP/s efetivos (trabalho da versão completa)", False, "gflops"),
+            ("ipc", "Instruções por ciclo (IPC)", False, "ipc"),
+        ]
+        for operation in OPERATIONS:
+            data = self.slice_op(self.raw, operation)
+            if data.empty:
+                continue
+            params = sorted(data.parameter.unique())
+            for metric, label, logy, short in metrics:
+                if metric not in data or data[metric].isna().all():
+                    continue
+                fig, axes = self.panels(len(params))
                 for ax, parameter in zip(axes, params):
-                    panel = subset[subset.parameter == parameter]
+                    panel = data[data.parameter == parameter]
                     for precision in ["double", "float"]:
-                        for technique in sorted(panel.technique.unique(), key=lambda x: x != "full"):
-                            points = []
-                            for n, group in panel[(panel.precision == precision) & (panel.technique == technique)].groupby("N"):
-                                mean, ci = self.mean_ci(group[metric])
-                                points.append((n, mean, ci))
+                        for step in sorted(panel.step.unique()):
+                            group = panel[(panel.precision == precision) & (panel.step == step)]
+                            points = [(n, *mean_ci(g[metric])) for n, g in group.groupby("N")]
                             if not points:
                                 continue
-                            points.sort()
-                            x, y, err = map(np.asarray, zip(*points))
-                            tech_label = "completa" if technique == "full" else "aproximada"
-                            ax.errorbar(x, y, yerr=err, color=COLORS[precision],
-                                        linestyle=TECH_LINE[technique], marker=TECH_MARK[technique],
-                                        capsize=2.5, linewidth=1.7, markersize=5,
-                                        label=f"{precision} · {tech_label}")
-                    symbol = "K" if operation != "gemm" else "B"
-                    self.finish(ax, "Ordem da matriz (N)", METRIC_LABEL[metric], f"{symbol} = {parameter}")
-                    ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
-                title = f"{OP_LABEL[operation]}: {METRIC_LABEL[metric].lower()} por tamanho"
-                fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-                note = "Média e IC 95% de 50 repetições; entrada uniforme."
-                if metric == "time_sec":
-                    note += " Tempo afetado pelo governador powersave."
-                fig.text(0.02, 0.01, note, fontsize=8, color="#555555")
-                fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-                self.save(fig, "01_desempenho", f"{operation}_{metric}", title,
-                          f"Como {METRIC_LABEL[metric].lower()} escala com N, precisão e técnica?",
-                          "results_raw.csv", f"dist={selected_dist}; 50 repetições; média e IC 95%")
+                            x, y, e = map(np.asarray, zip(*sorted(points)))
+                            self.series_line(ax, x, y, e, PREC_COLOR[precision], step,
+                                             f"{precision}, {step_label(step)}")
+                    self.style_axes(ax, "Ordem da matriz (N)", label if ax is axes[0] else None,
+                                    f"{param_symbol(operation)} = {parameter}", logx=True, logy=logy)
+                    self.set_n_ticks(ax, panel.N.unique())
+                title = f"{OP_LABEL[operation]}: {label.split(' (')[0].lower()}"
+                fig.tight_layout()
+                self.title(fig, title, f"Média e IC 95% das repetições; {self.slice_note(operation)}.")
+                self.legend_below(fig, axes=axes)
+                self.save(fig, "01_desempenho", f"{short}_{operation}", title,
+                          f"Como {label.lower()} varia com N, precisão e passo?", "results_raw.csv",
+                          self.slice_note(operation))
 
+    # ---------------------------------------------------------- comparações
     def precision_speedup(self):
-        for operation in ["conv_linear", "conv_malloc", "gemm"]:
-            selected_dist = -1 if operation == "gemm" else 0
-            panel = self.comp_raw[(self.comp_raw.operation == operation) &
-                                  (self.comp_raw.comparison == "precision") &
-                                  (self.comp_raw.dist == selected_dist)]
-            params = sorted(panel.parameter.unique())
-            fig, axes = plt.subplots(1, len(params), figsize=(4.2 * len(params), 4), sharey=True)
-            axes = np.atleast_1d(axes)
-            for ax, parameter in zip(axes, params):
-                points = []
-                for n, group in panel[panel.parameter == parameter].groupby("N"):
-                    mean, ci = self.mean_ci(group.cycles_speedup)
-                    points.append((n, mean, ci))
+        fig, axes = self.panels(len(OPERATIONS), sharey=False)
+        for ax, operation in zip(axes, OPERATIONS):
+            data = self.slice_op(self.comp, operation)
+            data = data[data.comparison == "precision"]
+            for i, parameter in enumerate(self.representative(data.parameter.unique())):
+                group = data[data.parameter == parameter]
+                points = [(n, *gmean_ci(g.time_speedup)) for n, g in group.groupby("N")]
+                if not points:
+                    continue
                 points.sort()
-                if points:
-                    x, y, err = map(np.asarray, zip(*points))
-                    ax.errorbar(x, y, yerr=err, color="#4d4d4d", marker="o", capsize=3)
-                ax.axhline(1, color="#777777", linestyle=":")
-                symbol = "K" if operation != "gemm" else "B"
-                self.finish(ax, "Ordem da matriz (N)", "Speedup em ciclos (double/float)", f"{symbol} = {parameter}", False)
-            title = f"Efeito da precisão em {OP_LABEL[operation].lower()}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            fig.text(0.02, 0.01, "Acima de 1: float consumiu menos ciclos. Média e IC 95% pareados.", fontsize=8)
-            fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-            self.save(fig, "02_comparacoes", f"precisao_{operation}", title,
-                      "A precisão float reduz os ciclos da versão completa?",
-                      "comparisons_raw.csv", f"comparison=precision; dist={selected_dist}")
+                x = np.array([p[0] for p in points]); y = np.array([p[1] for p in points])
+                err = [p[2] for p in points]
+                ax.errorbar(x, y, yerr=np.array(err).T, color=DIM[i], linestyle=["-", "--", ":"][i],
+                            marker="os^"[i], markersize=5, capsize=2.5, linewidth=1.5,
+                            label=f"{param_symbol(operation)} = {parameter}",
+                            markeredgecolor="white", markeredgewidth=0.6)
+            self.reference_line(ax)
+            self.style_axes(ax, "Ordem da matriz (N)", "Speedup double / float" if ax is axes[0] else None,
+                            OP_LABEL[operation], logx=True)
+            self.set_n_ticks(ax, data.N.unique())
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:  # legenda própria de cada painel, abaixo dele (K e B diferem)
+                ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.24),
+                          ncol=min(len(handles), 3), frameon=False, fontsize=7.5)
+        title = "Ganho de trocar double por float (versões completas)"
+        fig.tight_layout()
+        self.title(fig, title, "Acima de 1: float mais rápido. Média geométrica e IC 95% das repetições "
+                               "pareadas; até 3 valores de K ou B (menor, central, maior).")
+        self.save(fig, "02_comparacoes", "precisao_speedup", title,
+                  "Quanto a precisão float acelera cada operação?", "comparisons_raw.csv",
+                  "comparison=precision; recorte padrão de entrada e kernel")
 
     def approximation_speedup(self):
-        for operation in ["conv_linear", "conv_malloc", "gemm"]:
-            selected_dist = -1 if operation == "gemm" else 0
-            panel = self.comp_raw[(self.comp_raw.operation == operation) &
-                                  (self.comp_raw.comparison.str.startswith("approximation")) &
-                                  (self.comp_raw.dist == selected_dist)]
-            fig, ax = plt.subplots(figsize=(8, 5))
-            for precision in ["double", "float"]:
-                comp_name = f"approximation_{precision}"
-                for n, group_n in panel[panel.comparison == comp_name].groupby("N"):
-                    points = []
-                    for parameter, group in group_n.groupby("parameter"):
-                        mean, ci = self.mean_ci(group.cycles_speedup)
-                        points.append((parameter, mean, ci))
-                    points.sort()
-                    x, y, err = map(np.asarray, zip(*points))
-                    ax.errorbar(x, y, yerr=err, color=COLORS[precision],
-                                marker={512: "o", 1024: "s", 2048: "^"}[n],
-                                linestyle="-", capsize=2.5, label=f"{precision} · N={n}")
-            ax.axhline(1, color="#777777", linestyle=":")
-            xlabel = "Tamanho do kernel (K)" if operation != "gemm" else "Tamanho do bloco (B)"
-            title = f"Ganho da aproximação em {OP_LABEL[operation].lower()}"
-            self.finish(ax, xlabel, "Speedup em ciclos (completa/aproximada)", title)
-            fig.text(0.12, 0.01, "Acima de 1: a versão aproximada consumiu menos ciclos. Entrada uniforme.", fontsize=8)
-            fig.tight_layout(rect=(0, 0.04, 1, 1))
+        for operation in OPERATIONS:
+            data = self.slice_op(self.comp, operation)
+            data = data[data.comparison.isin(["approximation_double", "approximation_float"])]
+            if data.empty:
+                continue
+            params = sorted(data.parameter.unique())
+            sizes = sorted(data.N.unique())
+            fig, axes = self.panels(len(params))
+            for ax, parameter in zip(axes, params):
+                panel = data[data.parameter == parameter]
+                for comparison, precision in [("approximation_double", "double"), ("approximation_float", "float")]:
+                    for i, n in enumerate(sizes):
+                        group = panel[(panel.comparison == comparison) & (panel.N == n)]
+                        points = [(s, *gmean_ci(g.time_speedup)) for s, g in group.groupby("step")]
+                        if not points:
+                            continue
+                        points.sort()
+                        x = np.array([p[0] for p in points]); y = np.array([p[1] for p in points])
+                        ax.errorbar(x, y, yerr=np.array([p[2] for p in points]).T,
+                                    color=DIM[i % 3], linestyle="-" if precision == "double" else "--",
+                                    marker="o" if precision == "double" else "s", markersize=5,
+                                    capsize=2.5, linewidth=1.5, label=f"N = {n}, {precision}",
+                                    markeredgecolor="white", markeredgewidth=0.6)
+                self.reference_line(ax)
+                self.style_axes(ax, "Passo da aproximação", "Speedup completa / aproximada" if ax is axes[0] else None,
+                                f"{param_symbol(operation)} = {parameter}")
+                ax.set_xticks(sorted(panel.step.unique()))
+            title = f"Ganho de tempo da aproximação: {OP_LABEL[operation].lower()}"
+            fig.tight_layout()
+            self.title(fig, title, f"Mesma precisão na referência e na versão aproximada; {self.slice_note(operation)}.")
+            self.legend_below(fig, axes=axes, ncol=len(sizes))
             self.save(fig, "02_comparacoes", f"aproximacao_{operation}", title,
-                      "Quanto a técnica aproximada reduz os ciclos em cada configuração?",
-                      "comparisons_raw.csv", f"approximations; dist={selected_dist}; média e IC 95%")
+                      "Quanto cada passo de aproximação reduz o tempo?", "comparisons_raw.csv",
+                      self.slice_note(operation))
 
     def layout_comparison(self):
-        conv = self.raw[self.raw.operation.isin(["conv_linear", "conv_malloc"])].copy()
-        keys = ["precision", "technique", "N", "dist", "parameter", "repetition"]
-        wide = conv.pivot_table(index=keys, columns="operation", values=["cycles", "instructions"], aggfunc="first")
-        wide = wide.dropna().reset_index()
-        wide.columns = ["_".join(str(part) for part in col if part).rstrip("_")
-                        if isinstance(col, tuple) else col for col in wide.columns]
-        for metric in ["cycles", "instructions"]:
-            speedup_col = f"{metric}_speedup"
-            wide[speedup_col] = wide[f"{metric}_conv_linear"] / wide[f"{metric}_conv_malloc"]
-            fig, axes = plt.subplots(1, 2, figsize=(9, 4), sharey=True)
-            for ax, technique in zip(axes, ["full", "skip_kernel"]):
-                panel = wide[(wide.technique == technique) & (wide.dist == 0)]
-                for precision in ["double", "float"]:
-                    for k, group_k in panel[panel.precision == precision].groupby("parameter"):
-                        points = []
-                        for n, group in group_k.groupby("N"):
-                            mean, ci = self.mean_ci(group[speedup_col])
-                            points.append((n, mean, ci))
-                        points.sort()
-                        x, y, err = map(np.asarray, zip(*points))
-                        ax.errorbar(x, y, yerr=err, color=COLORS[precision], marker={3: "o", 5: "s", 7: "^"}[k],
-                                    capsize=2.5, label=f"{precision} · K={k}")
-                ax.axhline(1, color="#777777", linestyle=":")
-                self.finish(ax, "Ordem da matriz (N)", f"Razão contígua/linhas em {METRIC_LABEL[metric].lower()}",
-                            "Completa" if technique == "full" else "Aproximada")
-            title = f"Efeito da organização da memória sobre {METRIC_LABEL[metric].lower()}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            fig.text(0.02, 0.01, "Acima de 1: a implementação por linhas usou menos recursos.", fontsize=8)
-            fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-            self.save(fig, "02_comparacoes", f"layout_{metric}", title,
-                      "Qual implementação de convolução usa menos recursos?", "results_raw.csv",
-                      "conv_linear pareada com conv_malloc; dist=0")
+        conv = self.raw[self.raw.operation.isin(["conv_linear", "conv_malloc"])
+                        & (self.raw.dist == CONV_DIST) & (self.raw.kernel_type == CONV_KERNEL)]
+        if conv.empty:
+            return
+        keys = ["precision", "step", "N", "parameter", "repetition"]
+        wide = conv.pivot_table(index=keys, columns="operation", values="time_sec", aggfunc="first").dropna()
+        wide["ratio"] = wide["conv_linear"] / wide["conv_malloc"]
+        wide = wide.reset_index()
+        params = sorted(wide.parameter.unique())
+        fig, axes = self.panels(len(params))
+        for ax, parameter in zip(axes, params):
+            panel = wide[wide.parameter == parameter]
+            for precision in ["double", "float"]:
+                for step in sorted(panel.step.unique()):
+                    group = panel[(panel.precision == precision) & (panel.step == step)]
+                    points = [(n, *gmean_ci(g.ratio)) for n, g in group.groupby("N")]
+                    if not points:
+                        continue
+                    points.sort()
+                    self.series_line(ax, [p[0] for p in points], [p[1] for p in points],
+                                     [p[2] for p in points], PREC_COLOR[precision], step,
+                                     f"{precision}, {step_label(step)}", asymmetric=True)
+            self.reference_line(ax)
+            self.style_axes(ax, "Ordem da matriz (N)", "Tempo contígua / tempo por linhas" if ax is axes[0] else None,
+                            f"K = {parameter}", logx=True)
+            self.set_n_ticks(ax, panel.N.unique())
+        title = "Efeito da organização da memória na convolução"
+        fig.tight_layout()
+        self.title(fig, title, f"Acima de 1: alocação por linhas mais rápida; {self.slice_note('conv_linear')}.")
+        self.legend_below(fig, axes=axes)
+        self.save(fig, "02_comparacoes", "layout_memoria", title,
+                  "A alocação por linhas muda o tempo da convolução?", "results_raw.csv",
+                  self.slice_note("conv_linear"))
 
     def gemm_blocks(self):
-        panel = self.raw[(self.raw.operation == "gemm") & (self.raw.dist == -1)]
-        fig, axes = plt.subplots(1, 3, figsize=(12.5, 4), sharey=True)
-        for ax, n in zip(axes, sorted(panel.N.unique())):
+        data = self.slice_op(self.raw, "gemm")
+        if data.empty:
+            return
+        sizes = sorted(data.N.unique())
+        fig, axes = self.panels(len(sizes))
+        for ax, n in zip(axes, sizes):
+            panel = data[data.N == n]
             for precision in ["double", "float"]:
-                for technique in ["full", "skip_k"]:
-                    points = []
-                    for block, group in panel[(panel.N == n) & (panel.precision == precision) &
-                                              (panel.technique == technique)].groupby("parameter"):
-                        mean, ci = self.mean_ci(group.cycles)
-                        points.append((block, mean, ci))
-                    points.sort()
-                    x, y, err = map(np.asarray, zip(*points))
-                    ax.errorbar(x, y, yerr=err, color=COLORS[precision], linestyle=TECH_LINE[technique],
-                                marker=TECH_MARK[technique], capsize=2.5,
-                                label=f"{precision} · {'completa' if technique == 'full' else 'aproximada'}")
-            ax.set_xscale("log", base=2)
-            ax.set_xticks([8, 16, 32, 64, 128], labels=[8, 16, 32, 64, 128])
-            self.finish(ax, "Tamanho do bloco (B)", "Ciclos", f"N = {n}")
-            ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+                for step in sorted(panel.step.unique()):
+                    group = panel[(panel.precision == precision) & (panel.step == step)]
+                    points = [(b, *mean_ci(g.effective_gops)) for b, g in group.groupby("parameter")]
+                    if not points:
+                        continue
+                    x, y, e = map(np.asarray, zip(*sorted(points)))
+                    self.series_line(ax, x, y, e, PREC_COLOR[precision], step, f"{precision}, {step_label(step)}")
+            self.style_axes(ax, "Tamanho do bloco (B)", "GFLOP/s efetivos" if ax is axes[0] else None,
+                            f"N = {n}", logx=True)
+            self.set_n_ticks(ax, panel.parameter.unique())
         title = "Sensibilidade da GEMM ao tamanho do bloco"
-        fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-        fig.tight_layout(rect=(0, 0, 1, 0.94))
-        self.save(fig, "03_gemm_blocos", "gemm_blocos_ciclos", title,
-                  "Qual tamanho de bloco minimiza os ciclos da GEMM?", "results_raw.csv", "dist=-1 (GEMM não usa distribuição)")
+        fig.tight_layout()
+        self.title(fig, title, f"GFLOP/s calculados com o trabalho da versão completa; {self.slice_note('gemm')}.")
+        self.legend_below(fig, axes=axes)
+        self.save(fig, "03_gemm_blocos", "gemm_blocos_gflops", title,
+                  "Qual bloco maximiza a vazão útil da GEMM?", "results_raw.csv", self.slice_note("gemm"))
 
+    # ------------------------------------------------------------- qualidade
     def accuracy_plots(self):
-        precision = self.accuracy[self.accuracy.comparison == "precision"]
-        for operation in ["conv_linear", "conv_malloc", "gemm"]:
-            panel = precision[precision.operation == operation]
-            params = sorted(panel.parameter.unique())
-            fig, axes = plt.subplots(1, len(params), figsize=(4.1 * len(params), 4), sharey=True)
-            axes = np.atleast_1d(axes)
-            for ax, parameter in zip(axes, params):
-                for dist, group in panel[panel.parameter == parameter].groupby("dist"):
-                    group = group.sort_values("N")
-                    ax.plot(group.N, group.error_rel_mean, marker={-1: "o", 0: "o", 1: "s", 2: "^"}[dist],
-                            label=DIST_LABEL.get(dist, "sem distribuição"))
-                symbol = "K" if operation != "gemm" else "B"
-                self.finish(ax, "Ordem da matriz (N)", "Erro relativo médio", f"{symbol} = {parameter}", logy=True)
-            title = f"Erro de float em relação a double: {OP_LABEL[operation].lower()}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            fig.tight_layout(rect=(0, 0, 1, 0.94))
-            self.save(fig, "04_qualidade_numerica", f"precisao_erro_{operation}", title,
-                      "Qual erro é introduzido ao trocar double por float?", "accuracy.csv", "comparison=precision")
+        acc = self.accuracy
+        # Precisão: float contra double, versões completas.
+        prec = acc[acc.comparison == "precision"]
+        fig, axes = self.panels(len(OPERATIONS))
+        for ax, operation in zip(axes, OPERATIONS):
+            panel = prec[prec.operation == operation]
+            dists = sorted(panel.dist.unique())
+            for i, dist in enumerate(dists):
+                group = panel[panel.dist == dist].groupby("N").error_rel_norm.max().sort_index()
+                ax.plot(group.index, group.values, color=DIM[i % 3], marker="osD"[i % 3],
+                        linestyle=["-", "--", ":"][i % 3], linewidth=1.5, markersize=5,
+                        label=f"entrada {DIST_LABEL.get(dist, dist)}", markeredgecolor="white", markeredgewidth=0.6)
+            self.style_axes(ax, "Ordem da matriz (N)", "Erro relativo pela norma" if ax is axes[0] else None,
+                            OP_LABEL[operation], logx=True, logy=True)
+            self.set_n_ticks(ax, panel.N.unique())
+        title = "Erro de float em relação a double (versões completas)"
+        fig.tight_layout()
+        self.title(fig, title, "Pior caso entre parâmetros (K, B) e kernels; erro ‖C − R‖ / ‖R‖.")
+        self.legend_below(fig, axes=axes)
+        self.save(fig, "04_qualidade_numerica", "precisao_erro", title,
+                  "Qual erro a troca de double por float introduz?", "accuracy.csv", "comparison=precision")
 
-        conv = self.accuracy[(self.accuracy.operation == "conv_linear") &
-                             (self.accuracy.comparison.str.startswith("approximation"))]
-        for metric, label, logy in [("error_rel_mean", "Erro relativo médio", True), ("rmse", "RMSE", True)]:
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharey=True)
-            for ax, dist in zip(axes, [0, 1, 2]):
-                for comparison, group in conv[conv.dist == dist].groupby("comparison"):
-                    precision_name = comparison.replace("approximation_", "")
-                    for n, group_n in group.groupby("N"):
-                        group_n = group_n.sort_values("parameter")
-                        ax.plot(group_n.parameter, group_n[metric], color=COLORS[precision_name],
-                                marker={512: "o", 1024: "s", 2048: "^"}[n],
-                                label=f"{precision_name} · N={n}")
-                self.finish(ax, "Tamanho do kernel (K)", label, DIST_LABEL[dist].capitalize(), logy=logy)
-            title = f"Erro numérico do skip_kernel: {label}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            fig.text(0.02, 0.01, "As curvas de float e double coincidem; alguns símbolos ficam sobrepostos.", fontsize=8)
-            fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-            self.save(fig, "04_qualidade_numerica", f"skip_kernel_{metric}", title,
-                      "Como o erro do skip_kernel varia com K, N, precisão e distribuição?",
-                      "accuracy.csv", "conv_linear; aproximações")
+        # Aproximação na convolução: erro por passo, um painel por kernel.
+        conv = acc[(acc.operation == "conv_linear") & (acc.comparison == "approximation_double")]
+        kernels = [k for k in ["rand", "gauss", "sobel"] if k in set(conv.kernel_type)]
+        if kernels:
+            fig, axes = self.panels(len(kernels))
+            n_max = conv.N.max()
+            for ax, kernel in zip(axes, kernels):
+                panel = conv[(conv.kernel_type == kernel) & (conv.N == n_max)]
+                for i, dist in enumerate(sorted(panel.dist.unique())):
+                    for j, parameter in enumerate(sorted(panel.parameter.unique())):
+                        group = panel[(panel.dist == dist) & (panel.parameter == parameter)].sort_values("step")
+                        ax.plot(group.step, group.error_rel_norm, color=DIM[i % 3],
+                                linestyle=["-", "--", ":"][j % 3], marker="os^"[j % 3], markersize=5,
+                                linewidth=1.5, label=f"entrada {DIST_LABEL[dist]}, K = {parameter}",
+                                markeredgecolor="white", markeredgewidth=0.6)
+                self.style_axes(ax, "Passo da aproximação", "Erro relativo pela norma" if ax is axes[0] else None,
+                                f"Kernel {KERNEL_LABEL[kernel]}", logy=True)
+                ax.set_xticks(sorted(panel.step.unique()))
+            title = "Erro do skip_kernel por tipo de kernel"
+            fig.tight_layout()
+            self.title(fig, title, f"N = {n_max}; versão double (float coincide até 10⁻⁶); borda excluída.")
+            self.legend_below(fig, axes=axes, ncol=len(conv.dist.unique()))
+            self.save(fig, "04_qualidade_numerica", "skip_kernel_erro", title,
+                      "Como o erro do skip_kernel depende do kernel, da entrada e do passo?",
+                      "accuracy.csv", f"conv_linear; approximation_double; N={n_max}")
 
-        gemm = self.accuracy[(self.accuracy.operation == "gemm") &
-                             (self.accuracy.comparison.str.startswith("approximation"))]
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for comparison, group in gemm.groupby("comparison"):
-                precision_name = comparison.replace("approximation_", "")
-                for block, group_b in group.groupby("parameter"):
-                    group_b = group_b.sort_values("N")
-                    ax.plot(group_b.N, group_b.error_rel_mean, color=COLORS[precision_name], alpha=0.75,
-                            marker="o", label=f"{precision_name} · B={block}")
-        self.finish(ax, "Ordem da matriz (N)", "Erro relativo médio", None, logy=True)
-        title = "Erro numérico do skip_k na GEMM"
-        fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-        fig.text(0.12, 0.01, "As curvas de float e double coincidem; alguns símbolos ficam sobrepostos.", fontsize=8)
-        fig.tight_layout(rect=(0, 0.04, 1, 0.94))
-        self.save(fig, "04_qualidade_numerica", "skip_k_error_rel", title,
-                  "Como o erro do skip_k varia com N, bloco, precisão e distribuição?", "accuracy.csv")
+        # Aproximação na GEMM: erro por passo, um painel por distribuição.
+        gemm = acc[(acc.operation == "gemm") & (acc.comparison == "approximation_double")]
+        if not gemm.empty:
+            dists = sorted(gemm.dist.unique())
+            fig, axes = self.panels(len(dists))
+            for ax, dist in zip(axes, dists):
+                panel = gemm[gemm.dist == dist]
+                for i, n in enumerate(sorted(panel.N.unique())):
+                    group = panel[panel.N == n].groupby("step").error_rel_norm.mean().sort_index()
+                    ax.plot(group.index, group.values, color=DIM[i % 3], marker="os^"[i % 3],
+                            linestyle=["-", "--", ":"][i % 3], linewidth=1.5, markersize=5,
+                            label=f"N = {n}", markeredgecolor="white", markeredgewidth=0.6)
+                self.style_axes(ax, "Passo da aproximação", "Erro relativo pela norma" if ax is axes[0] else None,
+                                f"Entrada {DIST_LABEL.get(dist, dist)}", logy=True)
+                ax.set_xticks(sorted(panel.step.unique()))
+            title = "Erro do skip_k na GEMM"
+            fig.tight_layout()
+            self.title(fig, title, "Versão double; o erro não depende do bloco (mesmos índices k mantidos).")
+            self.legend_below(fig, axes=axes)
+            self.save(fig, "04_qualidade_numerica", "skip_k_erro", title,
+                      "Como o erro do skip_k depende da distribuição, de N e do passo?", "accuracy.csv",
+                      "gemm; approximation_double")
+
+    # ------------------------------------------------------------ compromisso
+    def tradeoff_handles(self, steps):
+        handles = [Line2D([], [], color=DIM[i % 3], marker="o", linestyle="none", markersize=7,
+                          label=f"passo {s}") for i, s in enumerate(steps)]
+        handles += [Line2D([], [], color=MUTED, marker=COMPARISON_MARK[c], linestyle="none", markersize=7,
+                           markerfacecolor="white" if c == "combined" else MUTED,
+                           label=COMPARISON_LABEL[c]) for c in COMPARISON_MARK]
+        return handles
 
     def tradeoff(self):
-        merged = self.comp.merge(
-            self.accuracy,
-            on=["operation", "N", "dist", "parameter", "comparison", "reference_program", "candidate_program"],
-            how="inner",
-        )
-        for operation in ["conv_linear", "conv_malloc", "gemm"]:
-            panel = merged[(merged.operation == operation) &
-                           (merged.comparison.str.startswith("approximation"))]
-            distributions = [-1] if operation == "gemm" else [0, 1, 2]
-            width = 7.2 if len(distributions) == 1 else 12.5
-            fig, axes = plt.subplots(1, len(distributions), figsize=(width, 4), sharex=False, sharey=True)
-            axes = np.atleast_1d(axes)
-            for ax, dist in zip(axes, distributions):
-                for comparison, group in panel[panel.dist == dist].groupby("comparison"):
-                    precision_name = comparison.replace("approximation_", "")
-                    for n, group_n in group.groupby("N"):
-                        ax.scatter(group_n.error_rel_mean, group_n.cycles_speedup_mean,
-                                   color=COLORS[precision_name], marker={512: "o", 1024: "s", 2048: "^"}[n],
-                                   s=38, alpha=0.8, label=f"{precision_name} · N={n}")
-                panel_title = "GEMM" if dist == -1 else DIST_LABEL[dist].capitalize()
-                self.finish(ax, "Erro relativo médio", "Speedup em ciclos", panel_title)
+        speed = (self.comp.groupby(["operation", "N", "dist", "parameter", "kernel_type", "comparison", "step"])
+                 .time_speedup.apply(lambda v: gmean_ci(v)[0]).rename("speedup").reset_index())
+        merged = speed.merge(self.accuracy, on=["operation", "N", "dist", "parameter", "kernel_type",
+                                                "comparison", "step"], how="inner")
+        merged = merged[merged.comparison.isin(COMPARISON_MARK)]
+        for operation in OPERATIONS:
+            data = merged[merged.operation == operation]
+            if data.empty:
+                continue
+            if operation == "gemm":
+                facets = [(f"Entrada {DIST_LABEL.get(d, d)}", data[data.dist == d]) for d in sorted(data.dist.unique())]
+            else:
+                facets = [(f"Kernel {KERNEL_LABEL.get(k, k)}", data[data.kernel_type == k])
+                          for k in ["rand", "gauss", "sobel"] if k in set(data.kernel_type)]
+            steps = sorted(data.step.unique())
+            fig, axes = self.panels(len(facets), height=3.6)
+            for ax, (label, panel) in zip(axes, facets):
+                for i, step in enumerate(steps):
+                    for comparison, marker in COMPARISON_MARK.items():
+                        group = panel[(panel.step == step) & (panel.comparison == comparison)]
+                        if group.empty:
+                            continue
+                        ax.scatter(group.error_rel_norm, group.speedup, s=30, marker=marker,
+                                   facecolor=DIM[i % 3] if comparison != "combined" else "white",
+                                   edgecolor=DIM[i % 3], linewidth=1.1, alpha=0.9, zorder=3)
+                self.reference_line(ax)
+                self.style_axes(ax, "Erro relativo pela norma (log)", "Speedup de tempo" if ax is axes[0] else None,
+                                label)
                 ax.set_xscale("log")
-                ax.axhline(1, color="#777777", linestyle=":")
-            title = f"Desempenho e erro: {OP_LABEL[operation].lower()}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            fig.tight_layout(rect=(0, 0, 1, 0.94))
+                self.log_error_axis(ax, "x")
+            title = f"Compromisso entre erro e desempenho: {OP_LABEL[operation].lower()}"
+            subtitle = "Cada ponto é uma combinação de N e parâmetro, todas as entradas."
+            fig.tight_layout()
+            self.title(fig, title, subtitle)
+            handles = self.tradeoff_handles(steps)
+            self.legend_below(fig, handles=handles, labels=[h.get_label() for h in handles],
+                              ncol=max(len(steps), 3))
             self.save(fig, "05_compromisso", f"tradeoff_{operation}", title,
-                      "Quanto de erro acompanha o ganho de ciclos da aproximação?",
-                      "comparisons_summary.csv + accuracy.csv")
+                      "Quanto de erro acompanha cada ganho de tempo?", "comparisons_raw.csv + accuracy.csv",
+                      "todas as entradas; comparações aproximadas e combinada")
 
-    def microarchitecture(self):
-        valid_dist = ((self.summary.operation == "gemm") & (self.summary.dist == -1)) | \
-                     ((self.summary.operation != "gemm") & (self.summary.dist == 0))
-        panel = self.summary[(self.summary.N == self.summary.N.max()) & valid_dist].copy()
-        preferred = ((panel.operation.str.startswith("conv") & (panel.parameter == 5)) |
-                     ((panel.operation == "gemm") & (panel.parameter == 16)))
-        panel = panel[preferred]
-        fig, ax = plt.subplots(figsize=(9, 6))
-        for _, row in panel.iterrows():
-            color = COLORS[row.precision]
-            marker = "o" if row.technique == "full" else "s"
-            ax.scatter(row.cache_miss_rate_mean, row.ipc_mean, color=color, marker=marker, s=85,
-                       edgecolor="black", linewidth=0.4)
-            ax.annotate(PROGRAM_SHORT[row.program], (row.cache_miss_rate_mean, row.ipc_mean),
-                        xytext=(5, 4), textcoords="offset points", fontsize=7)
-        title = "Assinatura microarquitetural das implementações"
-        self.finish(ax, "Taxa de faltas de cache", "IPC", title, False)
-        fig.text(0.12, 0.01, "N=2048, entrada uniforme, K=5 para convolução e B=16 para GEMM.", fontsize=8)
-        fig.tight_layout(rect=(0, 0.04, 1, 1))
-        self.save(fig, "06_microarquitetura", "ipc_cache", title,
-                  "Como IPC e faltas de cache distinguem as implementações?", "results_summary.csv")
+    # ---------------------------------------------------------------- energia
+    def energy(self):
+        if not self.has_energy:
+            return
+        # Energia absoluta por execução do kernel.
+        for metric, label, short, logy in [("energy_j", "Energia por execução (J)", "energia", True),
+                                           ("power_w", "Potência média (W)", "potencia", False)]:
+            fig, axes = self.panels(len(OPERATIONS), sharey=False)
+            for ax, operation in zip(axes, OPERATIONS):
+                data = self.slice_op(self.raw, operation)
+                parameter = sorted(data.parameter.unique())[len(data.parameter.unique()) // 2] if not data.empty else None
+                data = data[data.parameter == parameter]
+                for precision in ["double", "float"]:
+                    for step in sorted(data.step.unique()):
+                        group = data[(data.precision == precision) & (data.step == step)]
+                        points = [(n, *mean_ci(g[metric])) for n, g in group.groupby("N")]
+                        if not points:
+                            continue
+                        x, y, e = map(np.asarray, zip(*sorted(points)))
+                        self.series_line(ax, x, y, e, PREC_COLOR[precision], step, f"{precision}, {step_label(step)}")
+                self.style_axes(ax, "Ordem da matriz (N)", label if ax is axes[0] else None,
+                                f"{OP_LABEL[operation]}, {param_symbol(operation)} = {parameter}",
+                                logx=True, logy=logy)
+                self.set_n_ticks(ax, data.N.unique())
+            title = label.split(" (")[0] + " do pacote e da DRAM"
+            fig.tight_layout()
+            self.title(fig, title, "RAPL em modo sistema durante o lote de repetições; média e IC 95%.")
+            self.legend_below(fig, axes=axes)
+            self.save(fig, "06_energia", short, title, f"Como {label.lower()} varia com N, precisão e passo?",
+                      "results_raw.csv", "parâmetro central de cada operação; recorte padrão")
 
-        metrics = ["ipc_mean", "cache_miss_rate_mean", "branch_miss_rate_mean",
-                   "l1_dcache_load_misses_mean", "llc_load_misses_mean"]
-        matrix = panel.set_index("program")[metrics].astype(float)
-        normalized = (matrix - matrix.min()) / (matrix.max() - matrix.min()).replace(0, np.nan)
-        normalized = normalized.fillna(0)
-        fig, ax = plt.subplots(figsize=(8.5, 6.5))
-        image = ax.imshow(normalized.values, aspect="auto", cmap="viridis", vmin=0, vmax=1)
-        ax.set_yticks(range(len(normalized)), [PROGRAM_SHORT.get(x, x) for x in normalized.index], fontsize=8)
-        ax.set_xticks(range(len(metrics)), ["IPC", "Taxa cache", "Taxa desvios", "Faltas L1D", "Faltas LLC"],
-                      rotation=25, ha="right")
-        for i in range(normalized.shape[0]):
-            for j in range(normalized.shape[1]):
-                value = normalized.iloc[i, j]
-                ax.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=7,
-                        color="white" if value > 0.55 else "black")
-        fig.colorbar(image, ax=ax, label="Normalização min–max por coluna")
-        title = "Perfil normalizado dos contadores"
-        ax.set_title(title, loc="left", fontweight="bold")
+        # Economia de energia contra speedup de tempo.
+        comp = self.comp[self.comp.comparison.isin(COMPARISON_MARK)].dropna(subset=["energy_saving"])
+        if comp.empty:
+            return
+        agg = (comp.groupby(["operation", "N", "dist", "parameter", "kernel_type", "comparison", "step"])
+               .agg(speedup=("time_speedup", lambda v: gmean_ci(v)[0]),
+                    saving=("energy_saving", lambda v: gmean_ci(v)[0])).reset_index())
+        steps = sorted(agg.step.unique())
+        fig, axes = self.panels(len(OPERATIONS), sharey=False)
+        for ax, operation in zip(axes, OPERATIONS):
+            data = agg[agg.operation == operation]
+            for i, step in enumerate(steps):
+                for comparison, marker in COMPARISON_MARK.items():
+                    group = data[(data.step == step) & (data.comparison == comparison)]
+                    if group.empty:
+                        continue
+                    ax.scatter(group.speedup, group.saving, s=30, marker=marker,
+                               facecolor=DIM[i % 3] if comparison != "combined" else "white",
+                               edgecolor=DIM[i % 3], linewidth=1.1, alpha=0.9, zorder=3)
+            if not data.empty:
+                low = min(data.speedup.min(), data.saving.min(), 1.0) * 0.95
+                high = max(data.speedup.max(), data.saving.max(), 1.0) * 1.05
+                ax.plot([low, high], [low, high], color=MUTED, linestyle=(0, (2, 2)), linewidth=0.9, zorder=1)
+            self.style_axes(ax, "Speedup de tempo", "Economia de energia (referência / candidata)"
+                            if ax is axes[0] else None, OP_LABEL[operation])
+        title = "Economia de energia contra ganho de tempo"
         fig.tight_layout()
-        self.save(fig, "06_microarquitetura", "perfil_contadores", title,
-                  "Quais programas têm os maiores valores relativos em cada contador?", "results_summary.csv",
-                  "N=2048; dist=0; K=5/B=16")
+        self.title(fig, title, "Diagonal: economia de energia igual ao speedup. Acima dela, a potência caiu.")
+        handles = self.tradeoff_handles(steps)
+        self.legend_below(fig, handles=handles, labels=[h.get_label() for h in handles],
+                          ncol=max(len(steps), 3))
+        self.save(fig, "06_energia", "energia_vs_speedup", title,
+                  "A economia de energia acompanha o ganho de tempo?", "comparisons_raw.csv",
+                  "todas as entradas; comparações aproximadas e combinada")
 
+    # ------------------------------------------------------ microarquitetura
+    def microarchitecture(self):
+        if "cache_miss_rate" not in self.raw:
+            return
+        n_max = self.raw.N.max()
+        fig, axes = self.panels(len(OPERATIONS), sharey=False)
+        for ax, operation in zip(axes, OPERATIONS):
+            data = self.slice_op(self.raw, operation)
+            data = data[data.N == n_max]
+            for precision in ["double", "float"]:
+                for step in sorted(data.step.unique()):
+                    group = data[(data.precision == precision) & (data.step == step)]
+                    if group.empty:
+                        continue
+                    agg = group.groupby("parameter")[["cache_miss_rate", "ipc"]].mean()
+                    _, marker = STEP_STYLE.get(step, ("-", "o"))
+                    ax.scatter(agg.cache_miss_rate, agg.ipc, s=38, marker=marker, color=PREC_COLOR[precision],
+                               edgecolor="white", linewidth=0.6, zorder=3, label=f"{precision}, {step_label(step)}")
+            self.style_axes(ax, "Taxa de faltas de cache", "IPC" if ax is axes[0] else None, OP_LABEL[operation])
+        title = "Assinatura microarquitetural das implementações"
+        fig.tight_layout()
+        self.title(fig, title, f"N = {n_max}; cada ponto é um valor de K ou B; recorte padrão de entrada e kernel.")
+        self.legend_below(fig, axes=axes)
+        self.save(fig, "07_microarquitetura", "ipc_cache", title,
+                  "Como IPC e faltas de cache distinguem as versões?", "results_raw.csv", f"N={n_max}")
+
+    # --------------------------------------------------- reprodutibilidade
     def reproducibility(self):
-        valid_dist = ((self.summary.operation == "gemm") & (self.summary.dist == -1)) | \
-                     ((self.summary.operation != "gemm") & (self.summary.dist == 0))
-        panel = self.summary[(self.summary.N == self.summary.N.max()) & valid_dist].copy()
-        preferred = ((panel.operation.str.startswith("conv") & (panel.parameter == 5)) |
-                     ((panel.operation == "gemm") & (panel.parameter == 16)))
-        panel = panel[preferred].sort_values("program")
-        metrics = ["time_sec_cv", "cycles_cv", "instructions_cv"]
-        matrix = panel.set_index("program")[metrics].astype(float) * 100
-        fig, ax = plt.subplots(figsize=(7.8, 6.2))
-        positive = matrix.values[matrix.values > 0]
-        floor = positive.min() / 10 if len(positive) else 1e-10
-        log_values = np.log10(np.maximum(matrix.values, floor))
-        image = ax.imshow(log_values, aspect="auto", cmap="magma")
-        ax.set_yticks(range(len(matrix)), [PROGRAM_SHORT.get(x, x) for x in matrix.index], fontsize=8)
-        ax.set_xticks(range(3), ["Tempo", "Ciclos", "Instruções"])
+        n_max = self.raw.N.max()
+        columns = [("time_sec", "Tempo"), ("cycles", "Ciclos"), ("instructions", "Instruções"),
+                   ("energy_j", "Energia")]
+        columns = [(c, l) for c, l in columns if c in self.raw and self.raw[c].notna().any()]
+        rows, labels = [], []
+        for operation in OPERATIONS:
+            data = self.slice_op(self.raw, operation)
+            data = data[data.N == n_max]
+            if data.empty:
+                continue
+            parameter = sorted(data.parameter.unique())[len(data.parameter.unique()) // 2]
+            data = data[data.parameter == parameter]
+            for (precision, step), group in data.groupby(["precision", "step"]):
+                rows.append([100 * group[c].std(ddof=1) / group[c].mean() for c, _ in columns])
+                labels.append(f"{OP_LABEL[operation].split(' (')[0]} {operation.split('_')[-1] if operation != 'gemm' else ''} "
+                              f"{precision}, passo {step}".replace("  ", " "))
+        if not rows:
+            return
+        matrix = np.array(rows)
+        fig, ax = plt.subplots(figsize=(7.5, 0.32 * len(rows) + 1.8))
+        positive = matrix[np.isfinite(matrix) & (matrix > 0)]
+        floor = positive.min() / 10 if len(positive) else 1e-6
+        image = ax.imshow(np.log10(np.maximum(matrix, floor)), aspect="auto", cmap="Blues")
+        ax.set_yticks(range(len(labels)), labels, fontsize=7)
+        ax.set_xticks(range(len(columns)), [l for _, l in columns], fontsize=8)
         for i in range(matrix.shape[0]):
             for j in range(matrix.shape[1]):
-                ax.text(j, i, f"{matrix.iloc[i, j]:.3g}%", ha="center", va="center", fontsize=7,
-                        color="white" if log_values[i, j] > np.nanmedian(log_values) else "black")
-        fig.colorbar(image, ax=ax, label="log10 do CV (%)")
+                value = matrix[i, j]
+                shade = (np.log10(max(value, floor)) - np.log10(floor)) / max(np.log10(positive.max()) - np.log10(floor), 1e-9) if len(positive) else 0
+                ax.text(j, i, f"{value:.2g}%", ha="center", va="center", fontsize=6.5,
+                        color="white" if shade > 0.6 else INK)
+        cbar = fig.colorbar(image, ax=ax, orientation="horizontal", pad=0.08, fraction=0.04)
+        cbar.set_label("log10 do coeficiente de variação (%)", fontsize=8)
         title = "Reprodutibilidade das métricas"
-        ax.set_title(title, loc="left", fontweight="bold")
-        fig.tight_layout()
-        self.save(fig, "07_reprodutibilidade", "cv_metricas", title,
-                  "Quais métricas variaram mais entre as 50 repetições?", "results_summary.csv",
-                  "N=2048; dist=0; K=5/B=16")
+        ax.set_title(title, loc="left", fontweight="bold", color=INK)
+        self.save(fig, "08_reprodutibilidade", "cv_metricas", title,
+                  "Quais métricas variaram mais entre as repetições?", "results_raw.csv",
+                  f"N={n_max}; parâmetro central; recorte padrão")
 
-        valid_dist_raw = ((self.raw.operation == "gemm") & (self.raw.dist == -1)) | \
-                         ((self.raw.operation != "gemm") & (self.raw.dist == 0))
-        selected = self.raw[(self.raw.N == self.raw.N.max()) & valid_dist_raw].copy()
-        selected = selected[((selected.operation.str.startswith("conv")) & (selected.parameter == 5)) |
-                            ((selected.operation == "gemm") & (selected.parameter == 16))]
-        for metric in ["cycles", "time_sec"]:
-            fig, axes = plt.subplots(1, 3, figsize=(12, 4.8), sharey=False)
-            for ax, operation in zip(axes, ["conv_linear", "conv_malloc", "gemm"]):
-                operation_data = selected[selected.operation == operation]
-                programs = sorted(operation_data.program.unique())
-                values = [operation_data.loc[operation_data.program == p, metric].to_numpy() for p in programs]
-                labels = []
-                for program in programs:
-                    precision = "float" if "_float_" in program else "double"
-                    technique = "aprox." if ("skip_kernel" in program or "skip_k" in program) else "completa"
-                    labels.append(f"{precision}\n{technique}")
-                boxes = ax.boxplot(values, patch_artist=True, showfliers=True,
-                                   medianprops={"color": "black"}, **boxplot_label_argument(labels))
-                for patch, program in zip(boxes["boxes"], programs):
-                    patch.set_facecolor(COLORS["float" if "_float_" in program else "double"])
-                    patch.set_alpha(0.65)
-                self.finish(ax, None, METRIC_LABEL[metric], OP_LABEL[operation], False)
-                ax.tick_params(axis="x", labelsize=7)
-                if metric == "cycles":
-                    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
-            title = f"Distribuição das repetições: {METRIC_LABEL[metric].lower()}"
-            fig.suptitle(title, fontsize=14, fontweight="bold", x=0.02, ha="left")
-            note = "Cada painel usa sua própria escala para preservar a distribuição das 50 repetições."
-            if metric == "time_sec":
-                note += " Tempo afetado pelo governador powersave."
-            fig.text(0.02, 0.01, note, fontsize=8)
-            fig.tight_layout(rect=(0, 0.05, 1, 0.93))
-            self.save(fig, "07_reprodutibilidade", f"boxplot_{metric}", title,
-                      f"Como as 50 medições de {METRIC_LABEL[metric].lower()} se distribuem?",
-                      "results_raw.csv", "N=2048; dist=0; K=5/B=16")
-
-    def distribution_effect(self):
-        conv = self.summary[self.summary.operation.str.startswith("conv")].copy()
-        keys = ["operation", "program", "precision", "technique", "N", "parameter"]
-        rows = []
-        for key, group in conv.groupby(keys):
-            low, high = group.cycles_mean.min(), group.cycles_mean.max()
-            rows.append((*key, 100 * (high - low) / group.cycles_mean.mean()))
-        effect = pd.DataFrame(rows, columns=keys + ["amplitude_percentual"])
-        fig, ax = plt.subplots(figsize=(8.5, 4.8))
-        groups = []
-        labels = []
-        for operation in ["conv_linear", "conv_malloc"]:
-            for precision in ["double", "float"]:
-                groups.append(effect[(effect.operation == operation) & (effect.precision == precision)].amplitude_percentual)
-                labels.append(("Contígua" if operation == "conv_linear" else "Por linhas") + f"\n{precision}")
-        ax.boxplot(groups, patch_artist=True, showfliers=True, **boxplot_label_argument(labels))
-        title = "Efeito da distribuição das entradas sobre os ciclos"
-        self.finish(ax, None, "Amplitude entre distribuições (%)", title, False)
+        fig, axes = self.panels(len(OPERATIONS), sharey=False, height=3.8)
+        for ax, operation in zip(axes, OPERATIONS):
+            data = self.slice_op(self.raw, operation)
+            data = data[data.N == n_max]
+            if data.empty:
+                continue
+            parameter = sorted(data.parameter.unique())[len(data.parameter.unique()) // 2]
+            data = data[data.parameter == parameter]
+            groups = sorted(data.groupby(["precision", "step"]), key=lambda kv: (kv[0][0], kv[0][1]))
+            values = [g.time_sec.to_numpy() * 1e3 for _, g in groups]
+            labels = [f"{p[0]}\npasso {p[1]}" for p, _ in groups]
+            boxes = ax.boxplot(values, patch_artist=True, showfliers=True, widths=0.55,
+                               medianprops={"color": INK}, flierprops={"markersize": 3},
+                               **boxplot_label_argument(labels))
+            for patch, (key, _) in zip(boxes["boxes"], groups):
+                patch.set_facecolor(PREC_COLOR[key[0]])
+                patch.set_alpha(0.55)
+                patch.set_edgecolor(PREC_COLOR[key[0]])
+            self.style_axes(ax, None, "Tempo por execução (ms)" if ax is axes[0] else None,
+                            f"{OP_LABEL[operation]}, {param_symbol(operation)} = {parameter}")
+            ax.tick_params(axis="x", labelsize=7)
+        title = "Distribuição das repetições: tempo por execução"
         fig.tight_layout()
-        self.save(fig, "08_diagnosticos", "efeito_distribuicao", title,
-                  "A distribuição dos valores altera o custo das convoluções?", "results_summary.csv")
+        self.title(fig, title, f"N = {n_max}; cada caixa reúne as execuções independentes.")
+        self.save(fig, "08_reprodutibilidade", "boxplot_tempo", title,
+                  "Como as medições de tempo se distribuem?", "results_raw.csv", f"N={n_max}")
 
-    def correlation(self):
-        columns = ["time_sec", "cycles", "instructions", "ipc", "cache_miss_rate",
-                   "branch_miss_rate", "l1_dcache_load_misses", "llc_load_misses"]
-        corr = self.raw[columns].corr(method="spearman")
-        fig, ax = plt.subplots(figsize=(8, 7))
-        image = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
-        labels = ["Tempo", "Ciclos", "Instruções", "IPC", "Taxa cache", "Taxa desvios", "Faltas L1D", "Faltas LLC"]
-        ax.set_xticks(range(len(labels)), labels, rotation=35, ha="right")
-        ax.set_yticks(range(len(labels)), labels)
-        for i in range(len(labels)):
-            for j in range(len(labels)):
-                ax.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=7,
-                        color="white" if abs(corr.iloc[i, j]) > 0.55 else "black")
-        fig.colorbar(image, ax=ax, label="Correlação de Spearman")
-        title = "Correlação entre métricas da campanha"
-        ax.set_title(title, loc="left", fontweight="bold")
+    # ------------------------------------------------------------ diagnósticos
+    def diagnostics(self):
+        if "effective_ghz" not in self.raw or self.raw.effective_ghz.isna().all():
+            return
+        fig, ax = plt.subplots(figsize=(7.5, 3.6))
+        groups = [(op, self.raw[self.raw.operation == op].effective_ghz.dropna().to_numpy()) for op in OPERATIONS]
+        groups = [(op, v) for op, v in groups if len(v)]
+        boxes = ax.boxplot([v for _, v in groups], patch_artist=True, widths=0.5, medianprops={"color": INK},
+                           flierprops={"markersize": 3}, **boxplot_label_argument([OP_LABEL[o] for o, _ in groups]))
+        for patch in boxes["boxes"]:
+            patch.set_facecolor(PREC_COLOR['double']); patch.set_alpha(0.45); patch.set_edgecolor(PREC_COLOR['double'])
+        self.style_axes(ax, None, "Ciclos / tempo (GHz)")
+        ax.tick_params(axis="x", labelsize=7.5)
+        title = "Frequência efetiva durante o kernel"
         fig.tight_layout()
-        self.save(fig, "08_diagnosticos", "correlacao_metricas", title,
-                  "Quais métricas variam juntas no conjunto completo?", "results_raw.csv")
+        self.title(fig, title, "Com governor performance e sem turbo, deve ficar perto da nominal (2,4 GHz no E5-2407 v2).")
+        self.save(fig, "09_diagnosticos", "frequencia_efetiva", title,
+                  "A frequência ficou estável durante a campanha?", "results_raw.csv", "todas as execuções")
 
     def write_index(self):
         self.output.mkdir(parents=True, exist_ok=True)
-        csv_path = self.output / "INDICE_GRAFICOS.csv"
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        with (self.output / "INDICE_GRAFICOS.csv").open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.DictWriter(stream, fieldnames=self.index[0].keys())
             writer.writeheader()
             writer.writerows(self.index)
-        lines = [
-            "# Índice dos gráficos", "",
-            "Cada figura é gerada em PDF vetorial e PNG a 300 DPI. Os gráficos de tempo devem ser interpretados com a limitação do governador `powersave`; para esta campanha, ciclos são a métrica principal de desempenho.", "",
-            f"Total: **{len(self.index)} figuras**, em **{len(self.index) * len(self.formats)} arquivos gráficos**.", "",
-            "| Categoria | Figura | Pergunta | Filtros | Fonte |", "| --- | --- | --- | --- | --- |",
-        ]
+        lines = ["# Índice dos gráficos", "",
+                 f"Total: **{len(self.index)} figuras**, em {', '.join(self.formats)}.", "",
+                 f"Recorte padrão: convolução com entrada {DIST_LABEL[CONV_DIST]} e kernel "
+                 f"{KERNEL_LABEL[CONV_KERNEL]}; GEMM com entrada {DIST_LABEL[GEMM_DIST]}.", "",
+                 "| Categoria | Figura | Pergunta | Filtros | Fonte |", "| --- | --- | --- | --- | --- |"]
         for item in self.index:
-            lines.append(f"| `{item['categoria']}` | `{item['figura']}` | {item['pergunta']} | {item['filtros']} | `{item['fonte']}` |")
+            lines.append(f"| `{item['categoria']}` | `{item['figura']}` | {item['pergunta']} | "
+                         f"{item['filtros']} | `{item['fonte']}` |")
         (self.output / "INDICE_GRAFICOS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def run(self):
@@ -545,44 +744,36 @@ class Plotter:
         self.gemm_blocks()
         self.accuracy_plots()
         self.tradeoff()
+        self.energy()
         self.microarchitecture()
         self.reproducibility()
-        self.distribution_effect()
-        self.correlation()
+        self.diagnostics()
         self.write_index()
 
 
 def configure_style():
     plt.rcParams.update({
-        "figure.dpi": 120,
-        "savefig.dpi": 300,
-        "font.size": 10,
-        "axes.titlesize": 11,
-        "axes.labelsize": 10,
-        "legend.fontsize": 8,
-        "lines.linewidth": 1.7,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "figure.facecolor": "white",
-        "axes.facecolor": "white",
+        "figure.dpi": 120, "savefig.dpi": 300, "font.size": 9, "axes.titlesize": 10,
+        "axes.labelsize": 9, "legend.fontsize": 8, "lines.linewidth": 1.6,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "figure.facecolor": "white", "axes.facecolor": "white",
+        "axes.edgecolor": MUTED, "text.color": INK, "axes.labelcolor": INK,
     })
 
 
 def main():
     parser = argparse.ArgumentParser(description="Gera PDF e PNG dos resultados do TCC2.")
-    parser.add_argument("--data", default="results/analysis_data", help="diretório preparado dos CSVs")
-    parser.add_argument("--output", default="results/figures_full_20260922", help="diretório de saída")
+    parser.add_argument("--data", default="results/analysis_data", help="diretório com os CSVs da campanha")
+    parser.add_argument("--output", default="results/figures", help="diretório de saída")
     parser.add_argument("--formats", default="pdf,png", help="formatos separados por vírgula")
     parser.add_argument("--dpi", type=int, default=300)
-    parser.add_argument("--clean", action="store_true", help="remove somente a saída anterior de gráficos")
+    parser.add_argument("--clean", action="store_true", help="remove a saída anterior de gráficos")
     args = parser.parse_args()
-    data = Path(args.data).resolve()
-    output = Path(args.output).resolve()
-    required = ["results_raw.csv", "results_summary.csv", "comparisons_raw.csv",
-                "comparisons_summary.csv", "accuracy.csv"]
+    data, output = Path(args.data).resolve(), Path(args.output).resolve()
+    required = ["results_raw.csv", "results_summary.csv", "comparisons_raw.csv", "accuracy.csv"]
     missing = [name for name in required if not (data / name).is_file()]
     if missing:
-        raise SystemExit("[ERRO] Execute prepare_analysis_data.py antes. Ausentes: " + ", ".join(missing))
+        raise SystemExit("[ERRO] CSVs ausentes em " + str(data) + ": " + ", ".join(missing))
     formats = [item.strip().lower() for item in args.formats.split(",") if item.strip()]
     invalid = [item for item in formats if item not in {"pdf", "png", "svg"}]
     if invalid:

@@ -1,0 +1,33 @@
+# Submissão da campanha completa no HTCondor do sarue (nó único, Xeon E5-2407 v2, 4 núcleos).
+#
+# O Condor aqui serve para a campanha não depender de uma sessão aberta. Ele não
+# isola o benchmark de usuários interativos do servidor: rode em horário ocioso
+# (madrugada ou fim de semana) e confira o loadavg registrado em environment.txt.
+# Isso vale em dobro para a energia: o RAPL mede o pacote inteiro, e a potência
+# ociosa medida no início e no fim só é válida com a máquina parada.
+# Duração estimada da campanha completa nesse Xeon: 9 a 12 horas.
+#
+# Depois da campanha, restaure: sudo sysctl -w kernel.perf_event_paranoid=<valor anterior>
+#
+# Antes de submeter (como administrador do sarue):
+#   sudo cpupower frequency-set -g performance
+#   sudo sysctl -w kernel.nmi_watchdog=0
+#   sudo sysctl -w kernel.perf_event_paranoid=0      # 0 é exigido pela energia RAPL (modo sistema)
+#   python3 scripts/generate_inputs.py full          # uma vez, como o aluno
+#
+# Para retomar uma campanha interrompida, troque arguments por:
+#   arguments = --full --resume results/full_AAAAMMDD_HHMMSS
+
+universe       = vanilla
+executable     = scripts/run_benchmark.sh
+arguments      = --full
+initialdir     = $ENV(PWD)
+getenv         = True
+# Pede os 4 núcleos para que nenhum outro job do Condor rode junto.
+request_cpus   = 4
+request_memory = 8 GB
+should_transfer_files = NO
+output = condor/campanha_$(Cluster).out
+error  = condor/campanha_$(Cluster).err
+log    = condor/campanha_$(Cluster).log
+queue
