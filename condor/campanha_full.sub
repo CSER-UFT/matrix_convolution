@@ -13,7 +13,7 @@
 #   sudo cpupower frequency-set -g performance
 #   sudo sysctl -w kernel.nmi_watchdog=0
 #   sudo sysctl -w kernel.perf_event_paranoid=0      # 0 é exigido pela energia RAPL (modo sistema)
-#   python3 scripts/generate_inputs.py full          # uma vez, como o aluno
+#   python3 scripts/generate_inputs.py all           # inclui quick e full; execute uma vez
 #
 # Para retomar uma campanha interrompida, troque arguments por:
 #   arguments = --full --resume results/full_AAAAMMDD_HHMMSS
