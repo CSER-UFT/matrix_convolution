@@ -14,9 +14,9 @@
 #     e distribuição das matrizes do GEMM.
 #   * Os binários são recompilados e validados no nó que executa a campanha
 #     (-march=native corresponde à CPU usada de fato).
-#   * O governor precisa ser "performance"; o estado do turbo, o núcleo, os
-#     irmãos de SMT e o slot do Condor ficam registrados em environment.txt.
-#   * O núcleo padrão é o último permitido (a CPU 0 costuma atender interrupções).
+#   * O governor esperado é "powersave", condição fixa do sarue; seu estado,
+#     o turbo, o núcleo, os irmãos de SMT e o slot do Condor ficam registrados.
+#   * O processo fica preso à CPU 3 para evitar migrações entre núcleos.
 #   * A campanha pode ser retomada com --resume <diretório>.
 #
 # Uso:
@@ -27,14 +27,12 @@
 # campanha (ver condor/campanha_full.sub).
 #
 # Variáveis de ambiente opcionais:
-#   TCC2_CPU                núcleo usado (padrão: último núcleo permitido)
+#   TCC2_CPU                núcleo usado (padrão: 3)
 #   TCC2_REPETITIONS        execuções independentes por configuração
 #   TCC2_MIN_TIME           segundos de kernel por execução nas passadas 1 e 2 (padrão 0.2)
 #   TCC2_MIN_REPS           mínimo de repetições medidas por execução (padrão 3)
-#   TCC2_ENERGY=0           desliga a passada de energia (fica registrado)
 #   TCC2_ENERGY_MIN_TIME    segundos de kernel na passada de energia (padrão 1.0)
 #   TCC2_IDLE_SECONDS       duração de cada medição de potência ociosa (padrão 20)
-#   TCC2_ALLOW_GOVERNOR=1   aceita governor diferente de performance (fica registrado)
 #   TCC2_MARCH              alvo do -march (padrão native)
 #   TCC2_PAUSE_SECONDS      pausa entre execuções (padrão 0.05)
 set -euo pipefail
@@ -67,7 +65,7 @@ esac
 repetitions="${TCC2_REPETITIONS:-$repetitions}"
 min_time="${TCC2_MIN_TIME:-$min_time}"
 min_reps="${TCC2_MIN_REPS:-3}"
-energy_enabled="${TCC2_ENERGY:-1}"
+energy_enabled=1
 energy_min_time="${TCC2_ENERGY_MIN_TIME:-$energy_min_time}"
 idle_seconds="${TCC2_IDLE_SECONDS:-20}"
 pause="${TCC2_PAUSE_SECONDS:-0.05}"
@@ -105,26 +103,17 @@ for input in "${required[@]}"; do [[ -f "$input" ]] || { echo "Erro: entrada aus
 # ---------------------------------------------------------------------------
 # Núcleo, governor, turbo, ASLR e NMI watchdog
 # ---------------------------------------------------------------------------
-expand_cpus() { # "0-3,8" -> "0 1 2 3 8"
-  local part out=()
-  IFS=, read -ra parts <<< "$1"
-  for part in "${parts[@]}"; do
-    if [[ "$part" == *-* ]]; then out+=($(seq "${part%-*}" "${part#*-}")); else out+=("$part"); fi
-  done
-  echo "${out[@]}"
-}
 allowed=$(awk '/Cpus_allowed_list/ {print $2}' /proc/self/status)
-read -ra allowed_cpus <<< "$(expand_cpus "$allowed")"
-cpu="${TCC2_CPU:-${allowed_cpus[-1]}}"
+cpu="${TCC2_CPU:-3}"
 [[ "$cpu" =~ ^[0-9]+$ ]] || { echo "Erro: CPU invalida: $cpu" >&2; exit 1; }
 taskset -c "$cpu" true || { echo "Erro: CPU $cpu nao permitida para esta tarefa." >&2; exit 1; }
 
 sysfs="/sys/devices/system/cpu"
 read_or_unknown() { [[ -r "$1" ]] && cat "$1" || echo unknown; }
 governor=$(read_or_unknown "$sysfs/cpu$cpu/cpufreq/scaling_governor")
-if [[ "$governor" != performance && "${TCC2_ALLOW_GOVERNOR:-0}" != 1 ]]; then
-  echo "Erro: governor da CPU $cpu e '$governor'. Use 'performance' ou defina TCC2_ALLOW_GOVERNOR=1" >&2
-  echo "      (a condicao ficara registrada e devera ser discutida no texto)." >&2
+if [[ "$governor" != powersave ]]; then
+  echo "Erro: governor da CPU $cpu e '$governor'; a campanha exige 'powersave'." >&2
+  echo "      Use a mesma condicao em todos os testes antes de comparar resultados." >&2
   exit 1
 fi
 if [[ -r "$sysfs/intel_pstate/no_turbo" ]]; then
@@ -176,16 +165,13 @@ p2_events=$(join_by_comma "${P2[@]}")
 
 # Energia RAPL (modo sistema). Os dois domínios existem no Xeon E5 v2.
 P3=()
-if [[ "$energy_enabled" == 1 ]]; then
-  for event in power/energy-pkg/ power/energy-ram/; do
-    if perf stat -a -e "$event" -- true >/dev/null 2>&1; then P3+=("$event")
-    else echo "Aviso: evento de energia indisponivel: $event" >&2; fi
-  done
-  if [[ ${#P3[@]} -eq 0 ]]; then
-    echo "Erro: nenhum evento RAPL disponivel. Ajuste kernel.perf_event_paranoid para 0" >&2
-    echo "      (ou rode com TCC2_ENERGY=0, ficando a energia como limitacao declarada)." >&2
-    exit 1
-  fi
+for event in power/energy-pkg/ power/energy-ram/; do
+  if perf stat -a -e "$event" -- true >/dev/null 2>&1; then P3+=("$event")
+  else echo "Aviso: evento de energia indisponivel: $event" >&2; fi
+done
+if [[ ${#P3[@]} -eq 0 ]]; then
+  echo "Erro: nenhum evento RAPL disponivel. Ajuste kernel.perf_event_paranoid para 0" >&2
+  exit 1
 fi
 p3_events=$(join_by_comma "${P3[@]}")
 
@@ -240,7 +226,6 @@ manifest="$campaign/manifest.csv"
   echo "cpus_allowed=$allowed"
   echo "smt_siblings=$smt_siblings"
   echo "cpu_governor=$governor"
-  echo "allow_nonperformance_governor=${TCC2_ALLOW_GOVERNOR:-0}"
   echo "turbo=$turbo_state"
   echo "scaling_cur_freq_khz=$(read_or_unknown "$sysfs/cpu$cpu/cpufreq/scaling_cur_freq")"
   echo "scaling_max_freq_khz=$(read_or_unknown "$sysfs/cpu$cpu/cpufreq/scaling_max_freq")"

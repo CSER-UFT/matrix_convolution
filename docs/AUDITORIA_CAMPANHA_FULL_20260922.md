@@ -99,7 +99,7 @@ As instruções são praticamente determinísticas e os ciclos são muito mais e
 
 1. instruções, ciclos, IPC, contadores de cache, checksums e erros numéricos podem ser analisados;
 2. resultados de tempo devem ser apresentados com intervalo de confiança e aviso sobre o governador;
-3. para usar segundos como evidência principal do TCC, recomenda-se repetir a campanha com governador `performance`;
+3. para usar segundos como evidência principal do TCC, recomenda-se repetir a campanha com governador `powersave` mantido em todas as execuções, afinidade em uma CPU fixa e registro da frequência efetiva;
 4. não se deve corrigir artificialmente o tempo dividindo ciclos por 2,4 GHz, pois isso produziria tempo estimado, não tempo observado.
 
 ## Resultados de precisão: float contra double
@@ -275,6 +275,6 @@ Cuidados ao adaptar:
 
 A campanha terminou corretamente e produziu todos os dados planejados. Não há falha estrutural, perda de arquivos, erro de contador, multiplexação ou divergência de resultados.
 
-Os dados de ciclos, instruções, IPC, cache e erro numérico são adequados para análise. O tempo total foi medido corretamente, mas sob frequência altamente variável causada pelo governador `powersave`. Ele pode ser explorado com transparência e intervalos de confiança, porém não deve ser a única base para conclusões de desempenho. Uma repetição com governador `performance` é recomendada antes de considerar a campanha definitiva para afirmações em segundos.
+Os dados de ciclos, instruções, IPC, cache e erro numérico são adequados para análise. O tempo total foi medido corretamente, mas sob frequência altamente variável durante a campanha. Ele pode ser explorado com transparência e intervalos de confiança, porém não deve ser a única base para conclusões de desempenho. Uma repetição com o governador `powersave` padronizado, afinidade em uma CPU fixa e registro da frequência efetiva é recomendada antes de considerar a campanha definitiva para afirmações em segundos.
 
 Os próximos scripts de gráficos devem ler os CSVs preservados na campanha, gerar PDFs e PNGs, manter os dados brutos intactos e produzir também tabelas derivadas que documentem cada comparação.

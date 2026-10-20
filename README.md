@@ -19,7 +19,7 @@ sem Hyper-Threading, sem Turbo Boost, AVX sem FMA, L3 de 10 MB), 32 GB.
 | Erro relativo médio explodia com referência perto de zero. | Métrica principal `error_rel_norm` = ‖C − R‖ / ‖R‖, mais PSNR; borda da convolução excluída. |
 | Sem erro combinado contra a referência. | Comparação `combined`: `float` aproximado contra `double` completo. |
 | Energia citada como motivação, mas não medida. | Terceira passada do `perf` com RAPL (pacote e DRAM), potência ociosa no início e no fim, energia por execução, energia acima do ocioso e EDP. |
-| Governor powersave aceito com aviso; CPU 0 por padrão. | Exige `performance` (ou `TCC2_ALLOW_GOVERNOR=1`, registrado); usa o último núcleo permitido; registra turbo, slot do Condor e carga da máquina. |
+| Governor e núcleo podiam variar entre campanhas. | Usa `powersave` como condição fixa e prende o processo à CPU 3; registra governador, frequência, turbo, slot do Condor e carga da máquina. |
 | Binário compilado fora do nó de execução. | `run_benchmark.sh` recompila e valida no próprio nó. |
 | Falha no meio perdia a campanha. | `--resume <diretório>`. |
 | Gráficos com legendas dentro dos eixos, tapando dados. | `generate_plots.py` reescrito: legenda única abaixo dos painéis, fora da área de desenho; cores validadas para daltonismo; marcador e estilo de linha redundantes à cor. |
@@ -71,6 +71,7 @@ suportada.
 
 ```bash
 cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+taskset -c 3 true && echo "CPU 3 permitida: OK"
 cat /proc/sys/kernel/perf_event_paranoid
 cat /proc/sys/kernel/nmi_watchdog
 ```
@@ -78,28 +79,30 @@ cat /proc/sys/kernel/nmi_watchdog
 Condição esperada para a campanha definitiva:
 
 ```text
-governador: performance
+governador: powersave
+CPU usada pelo benchmark: 3
 kernel.perf_event_paranoid: 0
 kernel.nmi_watchdog: 0
 ```
 
-Se necessário, o administrador pode configurar:
+O governador já é `powersave` no Saruê e não precisa ser alterado. Se
+necessário, o administrador configura somente as permissões dos contadores:
 
 ```bash
-sudo cpupower frequency-set -g performance
 sudo sysctl -w kernel.perf_event_paranoid=0
 sudo sysctl -w kernel.nmi_watchdog=0
 ```
 
-`performance` reduz a variação de frequência entre as repetições. O valor
-zero de `perf_event_paranoid` permite a medição de energia em modo sistema. O
-NMI watchdog desligado libera um contador de hardware e reduz o risco de
-multiplexação.
+O script confirma que a CPU 3 está em `powersave` e interrompe a campanha se a
+condição for diferente. O valor zero de `perf_event_paranoid` permite a medição
+de energia em modo sistema. O NMI watchdog desligado libera um contador de
+hardware e reduz o risco de multiplexação.
 
-Se não houver permissão para mudar o governador, o pipeline também pode ser
-executado em `powersave`. Nesse caso, use a alternativa documentada em
-[Execução sem acesso ao governador `performance`](#execução-sem-acesso-ao-governador-performance).
-O governador encontrado fica registrado em `environment.txt`.
+A afinidade com a CPU 3 é necessária para impedir que o sistema migre o
+processo entre núcleos durante uma medição. Isso reduz uma fonte de variação e
+mantém todos os programas sob a mesma condição. A variável `TCC2_CPU` só é
+necessária se o projeto for executado em outra máquina onde a CPU 3 não esteja
+disponível.
 
 ### 3. Energia RAPL
 
@@ -117,10 +120,9 @@ perf stat -a -e power/energy-ram/ -- sleep 1
 ```
 
 O script precisa encontrar pelo menos um evento RAPL. O Xeon do sarue deve
-oferecer energia do pacote e pode oferecer energia da DRAM. `TCC2_ENERGY=0`
-permite diagnosticar o restante do pipeline sem energia, mas não resolve uma
-incompatibilidade com `--control` e não deve ser usado na campanha definitiva
-sem registrar essa limitação.
+oferecer energia do pacote e pode oferecer energia da DRAM. A medição fica
+sempre ativada pelo próprio código: não é necessário definir nenhuma variável
+antes do `--quick` ou do `--full`.
 
 ### 4. Entradas, compilação e validação
 
@@ -161,7 +163,7 @@ test -f "$QUICK_DIR/results_summary.csv"
 test -f "$QUICK_DIR/comparisons_raw.csv"
 test -f "$QUICK_DIR/comparisons_summary.csv"
 test -f "$QUICK_DIR/accuracy.csv"
-grep -E 'perf version|cpu_governor|perf_event_paranoid|p3_events|perf_scope' \
+grep -E '^cpu=|perf version|cpu_governor|perf_event_paranoid|p3_events|perf_scope' \
   "$QUICK_DIR/environment.txt"
 ```
 
@@ -176,60 +178,11 @@ minutos ou ficou bloqueado. Nesse caso, não execute o `full` antes de examinar 
 | `nao aceita '--delay=-1 --control'` | `perf` antigo ou sem suporte ao protocolo de controle | Disponibilizar um `perf` compatível; o Condor não corrige essa limitação. |
 | `evento obrigatorio indisponivel` | permissão do `perf` ou contador indisponível | Conferir `perf_event_paranoid` e testar `instructions:u` e `cycles:u` manualmente. |
 | `nenhum evento RAPL disponivel` | permissão, módulo ou domínio de energia ausente | Conferir `perf list`, testar `energy-pkg`/`energy-ram` e consultar o administrador. |
-| `governor ... Use 'performance'` | CPU em `powersave` ou outro governador | Alterar para `performance` ou seguir a execução alternativa com `TCC2_ALLOW_GOVERNOR=1`. |
+| `a campanha exige 'powersave'` | A CPU 3 está usando outro governador | Não execute a campanha até o servidor voltar à condição padrão `powersave`. |
+| `CPU 3 nao permitida` | O job não recebeu acesso à CPU 3 | Conferir a alocação do Condor; em outra máquina, escolher uma CPU fixa com `TCC2_CPU`. |
 | `entrada ausente` | foram geradas somente entradas `full` ou o manifesto está incompleto | Executar `python3 scripts/generate_inputs.py all` e validar `SHA256SUMS`. |
 | `contador ausente ou multiplexado` | NMI watchdog, eventos em excesso ou disputa por contadores | Desligar o NMI watchdog e repetir o `--quick`. |
 | teste sem avanço até o `timeout` | falha na confirmação entre o programa e `perf --control` | Não iniciar o `full`; guardar terminal e `.err` para análise. |
-
-## Execução sem acesso ao governador `performance`
-
-Esta alternativa permite terminar a campanha quando o governador estiver em
-`powersave` e não houver permissão para alterá-lo. Primeiro confirme qual
-governador está ativo:
-
-```bash
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
-```
-
-Faça o teste rápido permitindo explicitamente o governador encontrado:
-
-```bash
-TCC2_ALLOW_GOVERNOR=1 timeout 30m scripts/run_benchmark.sh --quick
-```
-
-Confira no resultado que o modo utilizado foi registrado:
-
-```bash
-QUICK_DIR=$(find results -maxdepth 1 -type d -name 'quick_*' | sort | tail -n1)
-grep -E 'cpu_governor|allow_nonperformance_governor|scaling_cur_freq' \
-  "$QUICK_DIR/environment.txt"
-```
-
-Se o `--quick` terminar corretamente, envie a campanha completa ao Condor com
-a mesma variável no ambiente:
-
-```bash
-export TCC2_ALLOW_GOVERNOR=1
-condor_submit condor/campanha_full.sub
-unset TCC2_ALLOW_GOVERNOR
-condor_q
-```
-
-O arquivo de submissão usa `getenv = True`, portanto a variável exportada é
-recebida pelo job. Após a campanha, confira o governador efetivamente usado:
-
-```bash
-FULL_DIR=$(find results -maxdepth 1 -type d -name 'full_*' | sort | tail -n1)
-grep -E 'cpu_governor|allow_nonperformance_governor|scaling_cur_freq' \
-  "$FULL_DIR"/environment*.txt
-```
-
-Em `powersave`, a frequência pode variar conforme a carga e aumentar a
-dispersão do tempo, dos contadores e da energia. A execução continua sendo
-utilizável porque o modo fica documentado, mas campanhas feitas com
-`performance` e `powersave` devem ser analisadas separadamente. Para comparar
-níveis de otimização do compilador, execute todos eles sob o mesmo governador
-e nas mesmas condições do servidor.
 
 ## Campanha completa pelo Condor
 
@@ -258,8 +211,8 @@ make plots DATA=results/full_AAAAMMDD_HHMMSS FIGURES=results/figuras_full
 `make plots`, que lê `results/analysis_data` por padrão).
 
 Variáveis úteis: `TCC2_REPETITIONS`, `TCC2_MIN_TIME`, `TCC2_MIN_REPS`,
-`TCC2_ENERGY=0` (desliga a energia), `TCC2_ENERGY_MIN_TIME`,
-`TCC2_IDLE_SECONDS`, `TCC2_CPU`. Todas descritas no topo do `run_benchmark.sh`.
+`TCC2_ENERGY_MIN_TIME`, `TCC2_IDLE_SECONDS` e `TCC2_CPU`. Todas descritas no
+topo do `run_benchmark.sh`. A energia já fica ativada e a CPU padrão já é 3.
 
 ## Interface dos programas
 
@@ -296,5 +249,5 @@ microarquitetura, reprodutibilidade e diagnóstico da frequência), com índice 
 recorte definido no topo do script (`CONV_DIST`, `CONV_KERNEL`, `GEMM_DIST`).
 
 A figura `09_diagnosticos/frequencia_efetiva` serve de controle: no E5-2407 v2,
-sem turbo e com governor `performance`, a frequência efetiva deve ficar perto
-de 2,4 GHz em todas as execuções.
+ela mostra a estabilidade e a variação da frequência efetiva com o governador
+`powersave`, que deve permanecer igual em toda a campanha.

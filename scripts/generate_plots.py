@@ -716,7 +716,7 @@ class Plotter:
         ax.tick_params(axis="x", labelsize=7.5)
         title = "Frequência efetiva durante o kernel"
         fig.tight_layout()
-        self.title(fig, title, "Com governor performance e sem turbo, deve ficar perto da nominal (2,4 GHz no E5-2407 v2).")
+        self.title(fig, title, "Com governor powersave, este controle revela a estabilidade e a variação da frequência entre execuções.")
         self.save(fig, "09_diagnosticos", "frequencia_efetiva", title,
                   "A frequência ficou estável durante a campanha?", "results_raw.csv", "todas as execuções")
 

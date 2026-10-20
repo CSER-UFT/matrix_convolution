@@ -10,7 +10,6 @@
 # Depois da campanha, restaure: sudo sysctl -w kernel.perf_event_paranoid=<valor anterior>
 #
 # Antes de submeter (como administrador do sarue):
-#   sudo cpupower frequency-set -g performance
 #   sudo sysctl -w kernel.nmi_watchdog=0
 #   sudo sysctl -w kernel.perf_event_paranoid=0      # 0 é exigido pela energia RAPL (modo sistema)
 #   python3 scripts/generate_inputs.py all           # inclui quick e full; execute uma vez
